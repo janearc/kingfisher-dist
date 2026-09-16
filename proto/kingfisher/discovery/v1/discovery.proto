@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+// kingfisher.discovery.v1 -- the librarian half.
+//
+// kingfisher has "discovery" of map sources it can
+// then add. "we don't have to have everything on disk. we can just go grab
+// data, and presuming that it fits, we can compose it." An index of what is
+// OUT THERE (NOAA InPort, USGS, Overture, NASA, Carto), not only what is held.
+//
+// EVERY FETCH IS FLIPR-GATED FROM BIRTH: fetch.enabled AND fetch.<source>,
+// defaults off, per the ratified onboarding contract
+// (flipr/docs/onboarding-kingfisher.md). Discovery (listing the index) is
+// cheap and carries no flag; FETCHING is the expensive act and is gated.
+
+package kingfisher.discovery.v1;
+
+import "kingfisher/map/v1/map.proto";
+
+message Source {
+  string id = 1;                 // TAXONOMY: matches the flipr flag suffix (fetch.<id>)
+  string title = 2;
+  string index_url = 3;
+  // expensive = the FETCH costs real resources (bandwidth, disk, someone
+  // else's servers). It is why flipr gates the fetch. It does NOT mean
+  // money -- the pill read as "costs money" and objected that free
+  // national lidar was marked expensive; `paid` below carries that.
+  bool expensive = 4;
+  // rides a paid key or account (carto). A display says "paid" off this
+  // and "free, big download" off expensive-without-paid.
+  bool paid = 5;
+  // ISO country code for the national programs; empty for global sources.
+  // the ask was "organized by country" -- the organization is data.
+  string country = 6;
+}
+
+// A dataset kingfisher KNOWS ABOUT, fetched or not. The manifest fields --
+// kind, domain, license -- are mandatory at REGISTRATION, not at fetch:
+// class and range are the compositing feature's inputs, and retrofitting
+// them at the twentieth dataset is how they end up wrong.
+message DatasetRecord {
+  string id = 1;
+  string source_id = 2;
+  string title = 3;
+  kingfisher.map.v1.LayerKind kind = 4;
+  kingfisher.map.v1.Domain domain = 5;
+  string license = 6;
+  uint64 bytes_estimate = 7;
+  FetchState state = 8;
+  string vintage_id = 9;
+  // where the bytes come from, verbatim from the provider's catalogue.
+  // The record is not useful as an index entry without it.
+  string download_url = 10;
+  // The throbber's numerator, and the reason it is a COUNT rather than a
+  // percentage: bytes_estimate is the provider's claim about an uncompressed
+  // file and is routinely wrong (a 19.6MB USGS estimate arrived as a 6.8MB
+  // LAZ). A display can honestly say "6.8MB so far"; it cannot honestly say
+  // 34% when it does not know the denominator. Moves only while FETCHING.
+  uint64 bytes_downloaded = 11;
+  // set when the fetch failed, so a display can say WHY rather than drawing a
+  // red dot the operator has to go read logs to understand.
+  string last_error = 12;
+  // Set with FETCH_STATE_TOMBSTONED: why an operator said this dataset is
+  // never to be fetched again, and when (RFC 3339). Empty otherwise.
+  string tombstone_reason = 13;
+  string tombstoned_at = 14;
+}
+
+enum FetchState {
+  FETCH_STATE_UNSPECIFIED = 0;   // not claimed as held: safe to be wrong about
+  FETCH_STATE_INDEXED = 1;       // known to exist, not held
+  FETCH_STATE_FETCHING = 2;
+  FETCH_STATE_HELD = 3;
+  FETCH_STATE_FAILED = 4;
+  // Accepted, not yet started. Distinct from FETCHING because a display that
+  // cannot tell them apart has to draw a spinner for both, and then a queue of
+  // six behind one slow download looks like six stalled downloads -- which is
+  // exactly how it read on screen. QUEUED is a promise; FETCHING
+  // is work in progress and is the only state where bytes_downloaded moves.
+  FETCH_STATE_QUEUED = 5;
+  // Never fetch this again, on an operator's word. The record stays -- title,
+  // url, reason, date -- so the decision is visible and reversible, and Fetch
+  // refuses it before it looks at a flag. Born from 119 CA_ALAMEDACO_2006
+  // lidar tiles were dead-lettered because their LAZ declares no CRS and
+  // ingestd refuses to guess; deleting the bytes without a tombstone would
+  // have had the next index refresh offer to download them all again.
+  FETCH_STATE_TOMBSTONED = 6;
+}
+
+service DiscoveryService {
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+  rpc ListDatasets(ListDatasetsRequest) returns (ListDatasetsResponse);
+  // the flipr-gated act. The response is a claim ticket, not the data:
+  // fetches are of arbitrary size on somebody else's servers.
+  // gated like a fetch: querying a provider's catalogue is a network call
+  // on somebody else's server, however small.
+  rpc RefreshIndex(RefreshIndexRequest) returns (RefreshIndexResponse);
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+  rpc GetFetchStatus(GetFetchStatusRequest) returns (GetFetchStatusResponse);
+  // an operator's word, recorded: mark a dataset never-fetch-again with a
+  // reason, or revive it to INDEXED. Not flag-gated: it spends nothing.
+  rpc Tombstone(TombstoneRequest) returns (TombstoneResponse);
+}
+
+message ListSourcesRequest {}
+message ListSourcesResponse { repeated Source sources = 1; }
+message ListDatasetsRequest { string source_id = 1; }
+message ListDatasetsResponse { repeated DatasetRecord datasets = 1; }
+message RefreshIndexRequest {
+  string source_id = 1;
+  repeated double bbox = 2;   // w, s, e, n
+  uint32 limit = 3;
+  // Narrow the provider's catalogue before the limit bites. GIBS publishes
+  // on the order of a thousand WMTS layers and the adapter took the first N
+  // in dict order, so anything past the cut was unreachable no matter how
+  // many times you asked -- which is exactly what happened to Black Marble,
+  // requested repeatedly and never once indexed. Matched case-insensitively
+  // against the provider's own id and title. Empty means everything, as
+  // before.
+  string query = 4;
+}
+message RefreshIndexResponse { uint32 indexed = 1; }
+message FetchRequest { string dataset_id = 1; }
+message FetchResponse { string ticket = 1; }
+message GetFetchStatusRequest { string ticket = 1; }
+message GetFetchStatusResponse { DatasetRecord record = 1; }
+message TombstoneRequest {
+  string dataset_id = 1;
+  string reason = 2;      // required unless revive
+  bool revive = 3;        // back to INDEXED; the reason and date are cleared
+}
+message TombstoneResponse { DatasetRecord record = 1; }

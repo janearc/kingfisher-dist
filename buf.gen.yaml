@@ -1,0 +1,15 @@
+# gen code is the contract made importable. NEVER hand-edited; regenerate
+# with bin/gen.sh and the committed output must match -- gen-freshness is
+# the check. Types only for now: the dispatch that uses them lands with the
+# RPC surface (compose/discovery/routing), not the tile path, which stays
+# static-file serving.
+# PLUGINS PINNED to the protoc that matches the runtime the image and the venv
+# carry (pyproject: protobuf>=7.36.0 is protoc 36.0). Unpinned, the remote
+# plugin drifted to 36.1 on 2026-09-05 and the regenerated modules refused to
+# import under the 7.36.0 runtime. Bump the pin and the runtime together.
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/python:v36.0
+    out: gen
+  - remote: buf.build/protocolbuffers/pyi:v36.0
+    out: gen

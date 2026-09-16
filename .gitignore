@@ -1,0 +1,24 @@
+# dev tooling only. none of this reaches the image -- the Dockerfile copies
+# serve.py and nothing else.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# runtime: the discovery index is a cache of other people's catalogues,
+# rebuildable by re-running RefreshIndex. It belongs in the spool volume,
+# never in the repository.
+spool/
+
+# a rendered overlay belongs to whoever rendered it: kube/<target>/ comes
+# from kube/template plus kube/environments/<target>.env, and only the
+# example env file ships.
+kube/*/
+!kube/base/
+!kube/template/
+!kube/environments/
+
+# what game build writes for a target; never shipped
+bin/*.log

@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+// kingfisher.routing.v1 -- routing behind the same catalogue.
+//
+// Small on purpose. Revised for the proxy ruling: Valhalla is
+// live upstream, the reduced matrix is the fast path, haversine the floor.
+
+package kingfisher.routing.v1;
+
+// What routing can answer, and over what ground. This is how the catalogue
+// says routing covers different territory than the census layers.
+message RoutingCapability {
+  repeated Mode modes = 1;
+  Extent extent = 2;
+  string tile_vintage = 3;   // memo key component: (mode, origin, destination, tile_vintage)
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_AUTO = 1;
+  MODE_BICYCLE = 2;
+  MODE_PEDESTRIAN = 3;
+}
+
+message Extent {
+  double w = 1;
+  double s = 2;
+  double e = 3;
+  double n = 4;
+}
+
+message Point {
+  double lat = 1;
+  double lng = 2;
+}
+
+// EVERY routing response says how it was answered. One field, two
+// obligations: which path served the request, and whether the answer is
+// degraded. The difference between labelled degradation and silent
+// substitution.
+//
+// ZERO VALUE RULING: _UNSPECIFIED stays at zero and
+// CLIENTS MUST RENDER IT AS AN ESTIMATE. This satisfies buf's
+// ENUM_ZERO_VALUE_SUFFIX without an ignore entry AND preserves a distinction
+// the alternative collapses: "the service said estimate" (METHOD_HAVERSINE)
+// vs "the service said nothing" (METHOD_UNSPECIFIED). A forgotten field
+// degrades toward "I am not sure", never toward "this is a road".
+//
+// Rendering: routes are PathLayer, solid, accent;
+// estimates are ArcLayer, lifted, dim. The tell is SHAPE, not texture --
+// dashes antialias to solid at exactly the zoom where someone scans.
+enum Method {
+  METHOD_UNSPECIFIED = 0;      // render as estimate
+  METHOD_REDUCED_MATRIX = 1;   // TAXONOMY: value names
+  METHOD_VALHALLA = 2;
+  METHOD_HAVERSINE = 3;
+}
+
+service RoutingService {
+  rpc GetCapability(GetCapabilityRequest) returns (GetCapabilityResponse);
+  // Valhalla's bulk primitive, and what a moving map actually wants. The
+  // superseded design got bulk free from a matrix on disk; a live proxy has
+  // to carry it on the wire.
+  rpc Matrix(MatrixRequest) returns (MatrixResponse);
+  rpc Route(RouteRequest) returns (RouteResponse);
+  // the degraded path, survives by design
+  rpc Estimate(EstimateRequest) returns (EstimateResponse);
+}
+
+message GetCapabilityRequest {}
+message GetCapabilityResponse { RoutingCapability capability = 1; }
+
+message MatrixRequest {
+  Mode mode = 1;
+  repeated Point sources = 2;
+  repeated Point targets = 3;
+}
+message MatrixResponse {
+  Method method = 1;
+  // row-major: sources x targets, seconds; -1 = unreachable
+  repeated double seconds = 2;
+  string tile_vintage = 3;
+}
+
+message RouteRequest {
+  Mode mode = 1;
+  Point origin = 2;
+  Point destination = 3;
+}
+message RouteResponse {
+  Method method = 1;
+  repeated Point path = 2;
+  double seconds = 3;
+  double meters = 4;
+  string tile_vintage = 5;
+}
+
+message EstimateRequest {
+  Mode mode = 1;
+  Point origin = 2;
+  Point destination = 3;
+}
+message EstimateResponse {
+  Method method = 1;
+  double seconds = 2;
+  double meters = 3;
+}

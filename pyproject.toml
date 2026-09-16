@@ -1,0 +1,65 @@
+# RETIRED: "stdlib-only is not a thing." The runtime was
+# stdlib-only while kingfisher was a mount table; the substrate it is
+# becoming (RPC surface, hexing, compositing, fetching) takes dependencies
+# as it needs them -- protobuf first, h3 next. Scope growth here is the
+# deliberate model, not drift: discovered -> into kingfisher -> display.
+
+[project]
+name = "kingfisher"
+version = "0.1.0"
+description = "H3 map data over HTTP"
+requires-python = ">=3.12"
+dependencies = [
+    "brotli>=1.2.0",
+    "kafka-python>=3.0.11",
+    # The point-cloud pipeline, and the promise at the top of this file kept:
+    # "protobuf first, h3 next". h3 is the whole reason this service exists --
+    # "H3 map data over HTTP" -- and until 2026-08-30 it was not a dependency
+    # of the thing named after it, because nothing had yet turned bytes into
+    # cells.
+    "h3>=4.1.0",
+    "numpy>=2.1.0",
+    # LAZ is not a format you can read with struct: the points are compressed
+    # with laszip and the tile that arrived says so in its own VLR. lazrs is
+    # the rust backend, chosen over laszip's C bindings so the image does not
+    # grow a compiler.
+    "laspy[lazrs]>=2.5.4",
+    # NEVER guess a projection. The USGS tile arrived in EPSG:26943 (NAD83 /
+    # California State Plane III) measured in US SURVEY FEET, horizontally and
+    # vertically, and every one of those facts is in the file rather than in
+    # anyone's assumption. Read the CRS, transform, convert the units. Assume
+    # metres and the terrain stands 3.28x too tall; assume the coordinates are
+    # degrees and the tile lands in the Gulf of Guinea.
+    "pyproj>=3.7.0",
+    "pillow>=12.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "protobuf>=7.36.0",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# serve.py sits at the repo root and is imported as a module by the suite
+pythonpath = ["."]
+addopts = [
+    "--cov=serve",
+    "--cov-report=term-missing",
+    "--cov-fail-under=90",
+    "-q",
+]
+
+[tool.coverage.run]
+source = ["serve"]
+
+[tool.coverage.report]
+# the two branches that need a client to hang up mid-body. reproducing a broken
+# pipe deterministically across platforms costs more in flake than it buys in
+# confidence, and both handlers do the same thing: swallow and carry on.
+exclude_also = [
+    "except BrokenPipeError:",
+    "if __name__ == .__main__.:",
+]

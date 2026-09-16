@@ -1,0 +1,408 @@
+{
+ "title": "kingfisher (${ENV})",
+ "uid": "kingfisher-${ENV}",
+ "tags": [
+  "${ENV}",
+  "kingfisher"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "refresh": "30s",
+ "time": {
+  "from": "now-3h",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "type": "timeseries",
+   "title": "tiles served, by resolution",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "sum by (kind) (rate(kingfisher_tiles_by_kind_total[5m]))",
+     "legendFormat": "{{kind}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "RPC rate, by method",
+   "gridPos": {
+    "x": 12,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "sum by (method) (rate(kingfisher_rpc_requests_total[5m]))",
+     "legendFormat": "{{method}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "RPC trouble (everything that is not ok/304)",
+   "gridPos": {
+    "x": 0,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "sum by (method,outcome) (rate(kingfisher_rpc_requests_total{outcome!~\"ok|not_modified\"}[5m]))",
+     "legendFormat": "{{method}} {{outcome}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "RPC mean duration, by method",
+   "gridPos": {
+    "x": 12,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "sum by (method) (rate(kingfisher_rpc_duration_seconds_sum[5m])) / sum by (method) (rate(kingfisher_rpc_duration_seconds_count[5m]))",
+     "legendFormat": "{{method}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "stat",
+   "title": "mounts readable (0 = the 404-forever failure)",
+   "gridPos": {
+    "x": 0,
+    "y": 16,
+    "w": 8,
+    "h": 6
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "green",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "kingfisher_mount_readable",
+     "legendFormat": "{{mount}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "disk under mounts",
+   "gridPos": {
+    "x": 8,
+    "y": 16,
+    "w": 8,
+    "h": 6
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "kingfisher_mount_bytes",
+     "legendFormat": "{{mount}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "heartbeat (the lease)",
+   "gridPos": {
+    "x": 16,
+    "y": 16,
+    "w": 8,
+    "h": 6
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(kingfisher_heartbeat_total[5m]))",
+     "legendFormat": "{{outcome}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "outbound to providers, by source and outcome",
+   "gridPos": {
+    "x": 0,
+    "y": 22,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "sum by (source,outcome) (rate(kingfisher_provider_requests_total[5m]))",
+     "legendFormat": "{{source}} {{outcome}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "bytes read from providers",
+   "gridPos": {
+    "x": 12,
+    "y": 22,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "Bps"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "sum by (source) (rate(kingfisher_provider_bytes_total[5m]))",
+     "legendFormat": "{{source}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "queue depth -- flat and above zero is stagnancy",
+   "description": "ingestd_spool_depth is items WAITING; ingestd_dead_depth is items set aside as permanently unprocessable. Depth is a level, not a count, and that is the whole point: '119 failures' is indistinguishable from a busy queue draining well, but '119 waiting while ingested stays flat' is a queue that does continuous work and makes no progress. Measured 2026-09-01: exactly that, for days, at 4,463 attempts per item per day.",
+   "gridPos": {
+    "x": 0,
+    "y": 30,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 10,
+      "showPoints": "never"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 20
+       },
+       {
+        "color": "red",
+        "value": 100
+       }
+      ]
+     },
+     "noValue": "no data - ingestd not exporting depth"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "ingestd_spool_depth",
+     "legendFormat": "waiting",
+     "refId": "A"
+    },
+    {
+     "expr": "ingestd_dead_depth",
+     "legendFormat": "set aside (dead)",
+     "refId": "B"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "is it draining? ingest vs failure vs give-up",
+   "description": "Read against the depth panel. Depth above zero with ingested at zero is the stagnancy signature. backing_off rising is the queue behaving correctly under a flaky provider; dead_lettered rising means items are leaving permanently, which is progress rather than damage -- they are moved to /spool/dead, never deleted, because kingfisher re-fetches.",
+   "gridPos": {
+    "x": 12,
+    "y": 30,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "rate(ingestd_ingested_total[15m]) * 60",
+     "legendFormat": "ingested/min",
+     "refId": "A"
+    },
+    {
+     "expr": "rate(ingestd_errors_total[15m]) * 60",
+     "legendFormat": "errors/min",
+     "refId": "B"
+    },
+    {
+     "expr": "rate(ingestd_backing_off_total[15m]) * 60",
+     "legendFormat": "backed off/min",
+     "refId": "C"
+    },
+    {
+     "expr": "rate(ingestd_dead_lettered_total[15m]) * 60",
+     "legendFormat": "dead-lettered/min",
+     "refId": "D"
+    }
+   ]
+  },
+  {
+   "type": "stat",
+   "title": "STAGNANT: waiting, but nothing completing",
+   "description": "Empty is healthy. A number here means items are queued and none has completed in thirty minutes -- the exact condition that ran unnoticed for days. This is the panel that would have caught it, and it reads the same whether the queue is screaming 531,000 times a day or, after backoff, sighing four times a minute. Resilience makes failure quiet; this is what keeps it visible. NOTE: this panel shows 'no data' when ingestd_spool_depth is absent, NOT 'healthy'. An earlier draft said 'draining normally' for the empty case, which asserts health from no evidence -- the exact false-zero this board exists to prevent. Absence of a metric and absence of a problem are different facts and must never render the same.",
+   "gridPos": {
+    "x": 0,
+    "y": 38,
+    "w": 24,
+    "h": 5
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ENV}-prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       }
+      ]
+     },
+     "noValue": "no data - is ingestd exporting spool_depth?"
+    },
+    "overrides": []
+   },
+   "targets": [
+    {
+     "expr": "ingestd_spool_depth > 0 and rate(ingestd_ingested_total[30m]) == 0",
+     "legendFormat": "items stuck",
+     "refId": "A"
+    }
+   ]
+  }
+ ]
+}

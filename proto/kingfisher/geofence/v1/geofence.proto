@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+// kingfisher.geofence.v1 -- regions as first-class, addressable data.
+//
+// kingfisher owns geofence data. A geofence is the
+// ADDRESSING of a region, and kingfisher is the thing that owns addressing;
+// the lesson is corvid's hand-maintained BBOX constant, whose own comment
+// warns that drift makes the view lie about what the router can reach. One
+// source, everyone asks, drift impossible.
+//
+// The three verbs, verbatim: hex an area (the darts-run
+// land-vs-water display, promoted); bake valhalla times for a geofence; and
+// hold the geofences themselves, which live in the surreal scope. Editing
+// stays a display-layer concern -- this package is the data authority only.
+
+package kingfisher.geofence.v1;
+
+import "kingfisher/routing/v1/routing.proto";
+
+message Geofence {
+  string id = 1;                            // TAXONOMY: naming scheme
+  string name = 2;
+  // rings of lat/lng; first ring is the boundary, others are holes
+  repeated Ring rings = 3;
+  string owner = 4;
+  string updated_at = 5;
+  // WHAT-FOR, where owner says WHOSE: bake targets, display fences and
+  // albatross's aggregation fences will share polygons without colliding
+  // meanings, and consumers select by tag ("aggregate") via ListGeofences.
+  // requested for the migration; the
+  // tag vocabulary is a TAXONOMY consult as it grows.
+  repeated string tags = 6;
+}
+
+message Ring {
+  repeated kingfisher.routing.v1.Point points = 1;
+}
+
+// land vs water per cell, from the darts-run tooling's mask work. The zero
+// is the safe-to-be-wrong value: a cell whose cover was never computed must
+// not claim to be land -- rendering unknown as ground is how a lake gets a
+// job marker in it.
+enum CellCover {
+  CELL_COVER_UNSPECIFIED = 0;
+  CELL_COVER_LAND = 1;
+  CELL_COVER_WATER = 2;
+  CELL_COVER_MIXED = 3;
+}
+
+service GeofenceService {
+  rpc ListGeofences(ListGeofencesRequest) returns (ListGeofencesResponse);
+  rpc GetGeofence(GetGeofenceRequest) returns (GetGeofenceResponse);
+  rpc PutGeofence(PutGeofenceRequest) returns (PutGeofenceResponse);
+  // hex an area: polygon or stored geofence to H3 cells at a resolution,
+  // each cell carrying its land/water cover
+  rpc HexArea(HexAreaRequest) returns (HexAreaResponse);
+  // bake travel times over a geofence's cells: the hexed cells as sources
+  // and targets through routing's Matrix, memoised on tile vintage. Long
+  // running, so it answers with a claim ticket like discovery's Fetch.
+  rpc BakeTimes(BakeTimesRequest) returns (BakeTimesResponse);
+  rpc GetBakeStatus(GetBakeStatusRequest) returns (GetBakeStatusResponse);
+}
+
+message ListGeofencesRequest {
+  // empty = all; otherwise fences carrying ANY of these tags. This is the
+  // whole point of tags existing: "give me the aggregation set" is one
+  // call, not a client-side filter over everything.
+  repeated string tags = 1;
+}
+message ListGeofencesResponse { repeated Geofence geofences = 1; }
+message GetGeofenceRequest { string id = 1; }
+message GetGeofenceResponse { Geofence geofence = 1; }
+message PutGeofenceRequest { Geofence geofence = 1; }
+message PutGeofenceResponse { string id = 1; }
+
+message HexAreaRequest {
+  // one of the two; a request naming both is an error, not a merge
+  string geofence_id = 1;
+  repeated Ring rings = 2;
+  uint32 res = 3;
+}
+message HexAreaResponse {
+  uint32 res = 1;
+  repeated string h = 2;
+  repeated CellCover cover = 3;
+}
+
+message BakeTimesRequest {
+  string geofence_id = 1;
+  kingfisher.routing.v1.Mode mode = 2;
+  uint32 res = 3;
+}
+message BakeTimesResponse { string ticket = 1; }
+message GetBakeStatusRequest { string ticket = 1; }
+message GetBakeStatusResponse {
+  BakeState state = 1;
+  // how the times were answered, per routing's ruling: labelled degradation,
+  // never silent substitution
+  kingfisher.routing.v1.Method method = 2;
+  uint32 cells = 3;
+  string tile_vintage = 4;
+}
+
+enum BakeState {
+  BAKE_STATE_UNSPECIFIED = 0;
+  BAKE_STATE_RUNNING = 1;
+  BAKE_STATE_DONE = 2;
+  BAKE_STATE_FAILED = 3;
+}

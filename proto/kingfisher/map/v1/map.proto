@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+// kingfisher.map.v1 -- the catalogue and chunk contract.
+//
+// Sources: data-2's joint draft (data-recon.md section 4), ratified and extended
+// Names marked TAXONOMY are
+// consults, not decisions; taxonomy rules on nouns.
+//
+// THE RULE EVERY ENUM IN THIS CONTRACT FOLLOWS
+// and binding here: pick the zero value that is SAFE TO BE WRONG ABOUT. A
+// service that forgets to set a field must degrade toward "I am not sure",
+// never toward a specific claim. This is peacock's founding rule on the wire:
+// a posting we could not place must not look like one that does not exist.
+
+package kingfisher.map.v1;
+
+// The whole document: what this kingfisher holds and can answer for.
+// Converges the two catalogue formats that exist today (econ's resN.json
+// header and layers/index.json) -- converging them IS this message's job;
+// neither format knows the other exists.
+message Catalogue {
+  repeated LayerDescriptor layers = 1;
+  repeated ResolutionDescriptor resolutions = 2;
+  // per-capability, not per-service: routing may cover the Bay Area while
+  // census layers cover fifty states, in one service. The catalogue must be
+  // able to say that.
+  repeated Footprint footprints = 3;
+  // the only mutable document in the store. Clients revalidate THIS and
+  // nothing else; chunks are immutable and cache forever.
+  string generated_at = 4;
+}
+
+message LayerDescriptor {
+  string id = 1;            // TAXONOMY: layer ids
+  string title = 2;
+  // intensive vs extensive decides the FOLD OPERATOR when resolutions are
+  // navigated: intensive quantities (rent, temperature) fold by mean;
+  // extensive ones (job counts, ride counts) fold by sum. Folding counts by
+  // mean silently deflates dense areas. The zero value refuses to fold
+  // rather than guessing -- see LayerKind.
+  LayerKind kind = 3;
+  string unit = 4;
+  Vintage vintage = 5;
+  // the seam with every display layer: kingfisher never returns a colour,
+  // and a frontend never decides a cell's value. The DISTRIBUTION for
+  // binning is what crosses the wire, and this is it.
+  Domain domain = 6;
+  Reliability reliability = 7;
+  string footprint_id = 8;
+  repeated uint32 resolutions = 9;
+  string license = 10;
+  string source = 11;
+}
+
+// A message, never a string: LODES already needs the Michigan override and a
+// string cannot carry it.
+message Vintage {
+  string id = 1;           // the cache-key component
+  uint32 year = 2;
+  string period = 3;
+  map<string, string> state_overrides = 4;  // usps -> vintage id
+}
+
+// min/max/percentiles for binning and normalisation. A declared range makes
+// normalisation stable across extents, vintages and viewers -- computing it
+// from whatever is loaded means the ramp shifts when the extent changes.
+message Domain {
+  double min = 1;
+  double max = 2;
+  double p05 = 3;
+  double p50 = 4;
+  double p95 = 5;
+  uint64 n = 6;
+}
+
+message Reliability {
+  uint64 n = 1;
+  double p50 = 2;
+  double p90 = 3;
+  double mute_above = 4;
+  double share_above_caution = 5;
+  double share_above_standard = 6;
+}
+
+message Footprint {
+  string id = 1;
+  repeated string states = 2;
+  repeated string missing = 3;
+  // region-scoped ON PURPOSE: degradation is a property of a state's data
+  // for a layer, and every cell inherits it. Flattening to a cell-level
+  // reason would lose the fact that the gap is systematic.
+  repeated DegradedRegion degraded = 4;
+  string note = 5;
+}
+
+message DegradedRegion {
+  string fips = 1;
+  string usps = 2;
+  string reason = 3;
+}
+
+message ResolutionDescriptor {
+  uint32 res = 1;
+  uint64 cells = 2;
+  // catalogue-declared, currently 3, never hardcoded in a client.
+  uint32 chunk_parent_res = 3;
+  uint64 chunk_count = 4;
+  uint64 total_bytes = 5;
+}
+
+// The chunk key is (layer_id, resolution, ancestor_cell, vintage_id) --
+// Layer and vintage enter the key
+// together or neither does: today's chunks hold 18 layers at four vintages,
+// so "the chunk's vintage" is malformed until per-layer re-cutting lands.
+// vintage_id and content_hash are the two fields that do not exist in
+// today's bytes; their absence is why no memo may be built yet.
+message ChunkRef {
+  string layer_id = 1;
+  uint32 res = 2;
+  string ancestor_cell = 3;
+  string vintage_id = 4;
+  string path = 5;
+  uint64 cells = 6;
+  uint64 bytes = 7;
+  string content_hash = 8;
+}
+
+message Chunk {
+  uint32 res = 1;
+  string parent = 2;
+  repeated string h = 3;        // H3 cell ids; absence from h[] means outside footprint
+  repeated LayerValues values = 4;
+  repeated string metro = 5;
+  repeated double metro_share = 6;
+}
+
+message LayerValues {
+  string layer_id = 1;
+  // null and absence mean DIFFERENT things and both are load-bearing:
+  // a null value carries a NoDataReason; a cell absent from h[] was never
+  // in the layer's footprint at all.
+  repeated double v = 2;
+  repeated double cv = 3;
+  repeated NoData nd = 4;
+}
+
+message NoData {
+  uint32 index = 1;             // into h[]
+  NoDataReason reason = 2;
+}
+
+// TAXONOMY: the state vocabulary. Five states, three expressions -- see
+// data-recon.md 4.3. The zero is "no value, reason unrecorded": a service
+// that forgets the field must not assert suppressed or state_unavailable,
+// because both are claims about WHY, and a wrong claim about why is worse
+// than an admitted gap.
+enum NoDataReason {
+  NO_DATA_REASON_UNSPECIFIED = 0;      // no value here, reason unrecorded
+  NO_DATA_REASON_SUPPRESSED = 1;
+  NO_DATA_REASON_STATE_UNAVAILABLE = 2;
+  NO_DATA_REASON_NOT_PUBLISHED = 3;
+}
+
+// Fold semantics for resolution navigation. The zero REFUSES: composing or
+// folding a layer whose kind is unspecified is an error, never a guess --
+// a wrong fold is a silently wrong map.
+enum LayerKind {
+  LAYER_KIND_UNSPECIFIED = 0;
+  LAYER_KIND_INTENSIVE = 1;   // folds by mean (rent, temperature, depth)
+  LAYER_KIND_EXTENSIVE = 2;   // folds by sum  (counts, totals)
+  // display assets -- glTF model packs, icon sets, font meshes. Opaque
+  // bytes served by URL, never folded, never composited: an asset in a
+  // compose input is an ERROR, same refusal as UNSPECIFIED. The license
+  // field is load-bearing for these (CC0 vs CC-BY decides attribution).
+  LAYER_KIND_ASSET = 3;
+  // origin/destination pairs -- uber trips, strava rides, any data that
+  // is edges between places rather than values at places ("lots of
+  // data that consists of pairs of stuff"). Pairs do not fold like cell
+  // values: they AGGREGATE (origins-per-cell and dests-per-cell are
+  // derived EXTENSIVE layers) and they ENRICH (Route infers the path,
+  // method-labelled, so an endpoints-only trip renders as an honest
+  // inference; the eta table prices the pair). A pairs layer in a compose
+  // input composes via its derived cell layers, never raw.
+  LAYER_KIND_PAIRS = 4;
+}
+
+service MapService {
+  rpc GetCatalogue(GetCatalogueRequest) returns (GetCatalogueResponse);
+  rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
+}
+
+message GetCatalogueRequest {}
+message GetCatalogueResponse { Catalogue catalogue = 1; }
+message GetChunkRequest { ChunkRef ref = 1; }
+message GetChunkResponse { Chunk chunk = 1; }

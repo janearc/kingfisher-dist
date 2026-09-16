@@ -1,0 +1,112 @@
+# kingfisher-ingestd -- the stomach, its own pod. Same image as kingfisher,
+# different entrypoint, and a memory limit sized for COMPUTE (smoothing a
+# point cloud) rather than serving -- which is the entire reason it is not
+# a thread in the serving pod. DESIGN.md carries the argument.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kingfisher-ingestd
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: kingfisher-ingestd
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kingfisher-ingestd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kingfisher-ingestd
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15022"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: ingestd
+          image: kingfisher:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/app/ingestd.py"]
+          ports:
+            - name: http
+              containerPort: 15022
+          env:
+            - name: KINGFISHER_SERVICE_NAME
+              value: kingfisher-ingestd
+            - name: KINGFISHER_SPOOL
+              value: /spool
+            - name: INGESTD_OUT
+              value: /maps/ingested
+            - name: KINGFISHER_FLIPR_URL
+              value: "http://flipr.flipr"
+            - name: KINGFISHER_KAFKA_BOOTSTRAP
+              value: "kafka.${NAMESPACE}:9092"
+            - name: KINGFISHER_SCHEMA_REGISTRY
+              value: "http://schema-registry.${NAMESPACE}:8081"
+          volumeMounts:
+            - name: spool
+              mountPath: /spool
+            # the ONE writer under maps/: ingestd owns ingested/, the
+            # serving pod reads it read-only
+            - name: maps-ingested
+              mountPath: /maps/ingested
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { cpu: "2", memory: 1Gi }
+      volumes:
+        - name: spool
+          hostPath:
+            path: ${DATA_ROOT}/spool
+            type: DirectoryOrCreate
+        - name: maps-ingested
+          hostPath:
+            path: ${DATA_ROOT}/maps/ingested
+            type: DirectoryOrCreate
+---
+# nobody has no api (mitigation-1, 2026-08-28, enclave audit): ingestd had
+# no Service and no route, so ingestd.test/health and ingestd.test/api were
+# unreachable by name, "no route by design" was the ruled-out answer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kingfisher-ingestd
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: kingfisher-ingestd
+spec:
+  selector:
+    app.kubernetes.io/name: kingfisher-ingestd
+  ports:
+    - name: http
+      port: 15022
+      targetPort: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: kingfisher-ingestd
+  namespace: ${NAMESPACE}
+spec:
+  entryPoints: [web]
+  routes:
+    # both names answer -- ingestd.test is the short form, kingfisher-ingestd.test
+    # is what the frood heartbeat identifies this pod as (KINGFISHER_SERVICE_NAME).
+    # Additive per mitigation-1's enclave audit, 2026-08-28: discovery finds
+    # services by their heartbeat name, and a route answering only the short
+    # name is invisible to it -- the same one-name-per-thing defect the
+    # athlete/kestrel rename closed, in miniature.
+    - match: Host(`ingestd.test`) || Host(`kingfisher-ingestd.test`)
+      kind: Rule
+      services:
+        - name: kingfisher-ingestd
+          port: 15022

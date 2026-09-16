@@ -1,0 +1,39 @@
+# the edge route, in the shape every service here uses.
+#
+# The model it preserves:  cloudflared -> traefik (k3s bundle) -> kingfisher
+# traefik is the only edge; this Service gets no NodePort and no hostPort.
+#
+# Three hostnames, matching the estate's precedent: .localhost resolves to
+# loopback on any device natively, .local is the name that means something
+# from another device once the tunnel publishes it, and .mesh is the estate's
+# private TLD. traefik-svc's coredns-mesh.yaml answers every *.mesh name with
+# traefik's ClusterIP by wildcard, so this name costs an IngressRoute and
+# nothing else -- no DNS change.
+#
+# None of these names resolves for a stranger -- traefik matches on the Host
+# header, which the client controls, so this is a routing rule and NOT an
+# access control. Anything reachable here is reachable by anyone on the LAN who
+# knows the name.
+#
+# What is exposed: read-only map data, plus /stats and /metrics, which say how
+# many files were served and how many bytes. There is nothing to write and no
+# credential anywhere in the process -- kingfisher opens files for reading and
+# does nothing else.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: kingfisher
+  namespace: fleet
+  labels:
+    app.kubernetes.io/name: kingfisher
+    app.kubernetes.io/part-of: fleet
+spec:
+  entryPoints: [web]
+  routes:
+    - kind: Rule
+      match: Host(`kingfisher.localhost`) || Host(`kingfisher.local`) || Host(`kingfisher.mesh`)
+      services:
+        - kind: Service
+          name: kingfisher
+          port: 15021
+          passHostHeader: true

@@ -1,0 +1,84 @@
+# MOVED HERE from kube/kustomization.yaml on 2026-09-04, when that file -- the
+# namespace `fleet` deploy, which no longer exists -- was retired. The warning
+# below is about the Deployment's selector, which is defined in this directory,
+# so this is where it belongs.
+# kingfisher in the fleet cluster: one container, no build step, no state.
+#
+# There is no Secret here and there never will be. kingfisher opens files for
+# reading and does nothing else -- no database, no upstream, no credential.
+#
+# Validate offline (no cluster, no apply):
+#   kubectl kustomize kube/
+#
+# Build the image where the cluster can see it, then land it. The IMPORT step
+# is not optional and is easy to miss: docker build puts the image in the host
+# daemon, and the k3d node runs its own containerd that cannot see it.
+#   docker build -t kingfisher:dev .
+#   k3d image import kingfisher:dev -c fleet
+#   kubectl apply -k kube/
+#   kubectl -n fleet rollout status deploy/kingfisher
+#
+# Then http://kingfisher.localhost:8800/ is the landing page, /metrics is the
+# prometheus text, and /econ/res8.json is the manifest corvid reads.
+#
+# THE HOSTPATH IS A STOPGAP. deployment.yaml mounts the workstation's disk
+# because peacock currently builds its map data into its own pod's emptyDir and
+# there is no shared copy to point at. When peacock becomes a client instead of
+# a server (janearc/peacock issue 35), those three hostPath volumes become one
+# PVC and nothing else in here changes.
+# ---------------------------------------------------------------------------
+# DO NOT "FIX" THE commonLabels DEPRECATION WARNING.
+#
+# Running `kubectl kustomize kube/` prints this, every time:
+#
+#     'commonLabels' is deprecated. Please use 'labels' instead.
+#     Run 'kustomize edit fix' to update your Kustomization automatically.
+#
+# Do not run that. Do not hand-migrate commonLabels to a plain `labels:` block
+# either. The suggestion is wrong for this Kustomization specifically.
+#
+# WHY. commonLabels adds its pairs to every resource AND to the Deployment's
+# spec.selector.matchLabels. The replacement `labels:` field does NOT touch
+# selectors unless explicitly told to. So the naive migration silently drops
+# app.kubernetes.io/part-of out of the selector, and spec.selector is IMMUTABLE
+# on a Deployment that already exists.
+#
+# WHAT HAPPENS IF YOU DO IT ANYWAY. The apply is refused:
+#
+#     The Deployment "kingfisher" is invalid: spec.selector: Invalid value:
+#     {"matchLabels":{"app.kubernetes.io/name":"kingfisher"}}: field is immutable
+#
+# Nothing breaks at that moment -- the Deployment is not modified and the pod
+# keeps serving. But the apply is PARTIAL: the Service is updated before the
+# Deployment is refused, so you are left half-applied, looking at an error you
+# were not expecting, on a service you were only trying to tidy.
+#
+# THE HAZARD IS WHAT YOU DO NEXT. The obvious way past "field is immutable" is
+# to delete the Deployment and recreate it. That is an outage, and this Service
+# answers for BOTH kingfisher.localhost AND corvid.localhost -- two front doors,
+# one pod. Do not take an outage to silence a cosmetic deprecation notice.
+#
+# IF THIS EVER GENUINELY HAS TO MIGRATE, this is the only safe form:
+#
+#     labels:
+#       - includeSelectors: true
+#         pairs:
+#           app.kubernetes.io/part-of: fleet
+#
+# Verified: that renders byte-for-byte identical to what commonLabels
+# produces today, and `kubectl apply --dry-run=server` reports the Deployment
+# unchanged. The same block WITHOUT includeSelectors is the one that gets
+# refused. The difference is one line and an outage.
+# ---------------------------------------------------------------------------
+# the environment-neutral base: what kingfisher is, with no opinion about
+# where it runs. an overlay rendered from kube/template decides namespace,
+# hosts, mounts and limits. corvid's route rides the base because it was the
+# first map; each overlay patches the Host to its own domain.
+# files directly and does not read this kustomization.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingressroute.yaml
+  - ingressroute-corvid.yaml

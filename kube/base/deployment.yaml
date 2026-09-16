@@ -1,0 +1,163 @@
+# kingfisher: one container, no build step, no state of its own.
+#
+# The data it serves lives on the host, outside the code tree, and is
+# mounted in. The node has to be able to see those paths: a hostPath the
+# node does not mount resolves to nothing, and the pod starts clean and
+# serves 404s. That is the one mistake this file is arranged to prevent.
+#
+# The roots below are defaults. A target's overlay, rendered from
+# kube/template by bin/render-overlay.py, replaces every one of them with
+# the roots that target owns, so nothing here names a real machine.
+#
+# readOnly is belt and braces: kingfisher never opens a file for writing
+# and re-checks every resolved path against its mount root, but a
+# read-only mount means a bug cannot become data loss.
+#
+# hostPath pins this pod to the node holding the files. Fine on a
+# single-node cluster, not fine the day it is not; the swap is a PVC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kingfisher
+  labels:
+    app.kubernetes.io/name: kingfisher
+    app.kubernetes.io/part-of: fleet
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    # DO NOT EDIT THIS SELECTOR, and do not strip the app.kubernetes.io/part-of
+    # label that kustomization.yaml's commonLabels adds to it. spec.selector is
+    # IMMUTABLE on a live Deployment -- changing it means delete and recreate,
+    # which is an outage on BOTH kingfisher.localhost and corvid.localhost.
+    # The long version, including the deprecation warning that invites exactly
+    # this mistake, is at the top of kube/kustomization.yaml.
+    matchLabels:
+      app.kubernetes.io/name: kingfisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kingfisher
+        app.kubernetes.io/part-of: fleet
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15021"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: kingfisher
+          image: kingfisher:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 15021
+          env:
+            - name: KINGFISHER_BIND
+              value: "0.0.0.0"
+            - name: KINGFISHER_PORT
+              value: "15021"
+            # served at /: the viewer bundle. a missing root is not fatal --
+            # the landing page still answers and says what is mounted.
+            - name: KINGFISHER_ROOT
+              value: /srv/viewer
+            # one namespace per source, so a caller can reason about where a
+            # thing came from without knowing the directory layout
+            - name: KINGFISHER_MOUNTS
+              value: "/econ/=/data/econ,/layers/=/data/layers,/rides/=/data/rides,/base/=/data/base"
+          volumeMounts:
+            - name: econ
+              mountPath: /data/econ
+              readOnly: true
+            - name: layers
+              mountPath: /data/layers
+              readOnly: true
+            - name: rides
+              mountPath: /data/rides
+              readOnly: true
+            - name: base
+              mountPath: /data/base
+              readOnly: true
+            - name: viewer
+              mountPath: /srv/viewer
+              readOnly: true
+            # the shared bench look. mountPath matches the host path on purpose
+            # -- the volume line documents itself and nobody has to hold a
+            # translation in their head. /var/mesh-ui is the fleet convention.
+            - name: bench-ui
+              mountPath: /var/mesh-ui
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              # it reads files and copies bytes. if it needs more than this,
+              # something is wrong rather than busy.
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        # the datasets, one mount each; see the note at the top.
+        - name: econ
+          hostPath:
+            path: /srv/kingfisher/maps/econ
+            type: Directory
+        - name: layers
+          hostPath:
+            path: /srv/kingfisher/maps/layers
+            type: Directory
+        - name: rides
+          hostPath:
+            path: /srv/kingfisher/maps/rides
+            type: Directory
+        # the basemap, glyphs, world outline, lakes and rivers: the ground
+        # the data is drawn on, as opposed to the data. a viewer fetches all
+        # six by name, and without them a client would render numbers over
+        # an empty page.
+        - name: base
+          hostPath:
+            path: /srv/kingfisher/maps/base
+            type: Directory
+        - name: viewer
+          hostPath:
+            path: /srv/kingfisher/maps/viewer
+            type: Directory
+        # bench-ui (janearc/bench-ui), installed by its install.sh. This is the
+        # one file every bench in the estate reads, so kingfisher stops carrying
+        # its own copy of the house palette.
+        #
+        # MOUNT THE DIRECTORY, NOT THE FILE. Not because the installer replaces
+        # the inode -- measured, it does not; `build > "$dst"` truncates in
+        # place. Two reasons that survive that: the installer is one tidy-up
+        # away from write-to-temp-then-rename, which is the more careful idiom
+        # and would pin a file bind-mount to a dead inode with nothing in any
+        # log; and the store grows -- themes are already separate files there.
+        #
+        # type: Directory means the pod refuses to schedule if bench-ui was
+        # never installed, rather than starting clean and serving an unstyled
+        # page nobody notices. Same reasoning as the hostPath trap above. It
+        # does make install.sh a PREREQUISITE on this pod, not a convenience.
+        - name: bench-ui
+          hostPath:
+            path: /srv/kingfisher/ui
+            type: Directory

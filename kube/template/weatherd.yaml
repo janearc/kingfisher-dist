@@ -1,0 +1,96 @@
+# kingfisher-weatherd -- atmospheric conditions, polled. Same shape as
+# openskyd's own file; see that comment for the "why its own pod" argument.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kingfisher-weatherd
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: kingfisher-weatherd
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kingfisher-weatherd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kingfisher-weatherd
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15024"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: weatherd
+          image: kingfisher:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/app/weatherd.py"]
+          ports:
+            - name: http
+              containerPort: 15024
+          env:
+            - name: KINGFISHER_SERVICE_NAME
+              value: kingfisher-weatherd
+            - name: WEATHERD_OUT
+              value: /maps/weather
+            - name: KINGFISHER_FLIPR_URL
+              value: "http://flipr.flipr"
+            - name: KINGFISHER_KAFKA_BOOTSTRAP
+              value: "kafka.${NAMESPACE}:9092"
+            - name: KINGFISHER_SCHEMA_REGISTRY
+              value: "http://schema-registry.${NAMESPACE}:8081"
+          volumeMounts:
+            # the ONE writer under maps/: weatherd owns weather/, the
+            # serving pod reads it read-only -- same split as flights/
+            - name: maps-weather
+              mountPath: /maps/weather
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+      volumes:
+        - name: maps-weather
+          hostPath:
+            path: ${DATA_ROOT}/maps/weather
+            type: DirectoryOrCreate
+---
+# nobody has no api (mitigation-1, 2026-08-28, enclave audit): every daemon
+# gets a Service + route from birth now, not bolted on after an audit finds
+# the gap. Both names answer, matching ingestd/openskyd's additive fix.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kingfisher-weatherd
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: kingfisher-weatherd
+spec:
+  selector:
+    app.kubernetes.io/name: kingfisher-weatherd
+  ports:
+    - name: http
+      port: 15024
+      targetPort: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: kingfisher-weatherd
+  namespace: ${NAMESPACE}
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`weatherd.test`) || Host(`kingfisher-weatherd.test`)
+      kind: Rule
+      services:
+        - name: kingfisher-weatherd
+          port: 15024

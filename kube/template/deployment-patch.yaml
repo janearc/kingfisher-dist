@@ -1,0 +1,130 @@
+# the target's shape. what this patch says, in order: the target's own
+# data root, never another target's; the in-cluster names for flipr and
+# the router; and an explicit memory limit, because on a host shared with
+# other schedulers the limit is the only thing between them and
+# double-booking it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kingfisher
+spec:
+  template:
+    spec:
+      containers:
+        - name: kingfisher
+          env:
+            - name: KINGFISHER_BIND
+              value: "0.0.0.0"
+            - name: KINGFISHER_PORT
+              value: "15021"
+            - name: KINGFISHER_ROOT
+              value: /srv/viewer
+            - name: KINGFISHER_MOUNTS
+              value: "/econ/=/data/econ,/layers/=/data/layers,/rides/=/data/rides,/base/=/data/base,/eta/=/data/eta,/ingested/=/data/ingested,/flights/=/data/flights,/weather/=/data/weather,/clouds/=/data/clouds"
+            # names, never addresses: cluster DNS decides which flipr and
+            # which valhalla, which is the whole environment story
+            - name: KINGFISHER_FLIPR_URL
+              value: "http://flipr.flipr"
+            - name: KINGFISHER_VALHALLA_URL
+              value: "http://valhalla.${NAMESPACE}:8002"
+            - name: KINGFISHER_SPOOL
+              value: /spool
+            # the bus, by name: the heartbeat IS the lease, and silence is
+            # what hall-monitor judges
+            - name: KINGFISHER_KAFKA_BOOTSTRAP
+              value: "kafka.${NAMESPACE}:9092"
+            - name: KINGFISHER_SCHEMA_REGISTRY
+              value: "http://schema-registry.${NAMESPACE}:8081"
+            # the carto basemap key. the value lives in a kubernetes secret
+            # the operator creates by hand; this is the reference and only
+            # the reference. optional: the pod runs
+            # without it, and fetch.carto is off until it exists anyway.
+            # The fence store, by name. NO CREDENTIALS: postgrest logs into
+            # postgres as a near-powerless role and SET ROLEs per request, so
+            # postgres's own GRANTs decide what this pod may read. The scoped
+            # maps secret that used to sit here has nothing
+            # left to authenticate.
+            - name: KINGFISHER_API_URL
+              value: "http://postgrest.${NAMESPACE}:3000"
+            - name: CARTO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: carto-basemap-api-key
+                  key: key
+                  optional: true
+          volumeMounts:
+            - name: spool
+              mountPath: /spool
+            - name: eta
+              mountPath: /data/eta
+              readOnly: true
+            - name: ingested
+              mountPath: /data/ingested
+              readOnly: true
+            - name: flights
+              mountPath: /data/flights
+              readOnly: true
+            - name: weather
+              mountPath: /data/weather
+              readOnly: true
+            - name: clouds
+              mountPath: /data/clouds
+              readOnly: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+      volumes:
+        # hostPath, shared with ingestd: fetches survive pod restarts and
+        # the daemon consumes them across the pod boundary
+        - name: spool
+          hostPath:
+            path: ${DATA_ROOT}/spool
+            type: DirectoryOrCreate
+        - name: ingested
+          hostPath:
+            path: ${SHELF_ROOT}/ingested
+            type: DirectoryOrCreate
+        - name: flights
+          hostPath:
+            path: ${SHELF_ROOT}/flights
+            type: DirectoryOrCreate
+        - name: weather
+          hostPath:
+            path: ${SHELF_ROOT}/weather
+            type: DirectoryOrCreate
+        - name: clouds
+          hostPath:
+            path: ${SHELF_ROOT}/clouds
+            type: DirectoryOrCreate
+        - name: eta
+          hostPath:
+            path: ${SHELF_ROOT}/eta
+            type: Directory
+        - name: econ
+          hostPath:
+            path: ${SHELF_ROOT}/econ
+            type: Directory
+        - name: layers
+          hostPath:
+            path: ${SHELF_ROOT}/layers
+            type: Directory
+        - name: rides
+          hostPath:
+            path: ${SHELF_ROOT}/rides
+            type: Directory
+        - name: base
+          hostPath:
+            path: ${SHELF_ROOT}/base
+            type: Directory
+        - name: viewer
+          hostPath:
+            path: ${SHELF_ROOT}/viewer
+            type: Directory
+        - name: bench-ui
+          hostPath:
+            path: ${UI_ROOT}
+            type: DirectoryOrCreate

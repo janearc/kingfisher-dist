@@ -1,0 +1,48 @@
+# kingfisher's overlay for one target, rendered from kube/template by
+# bin/render-overlay.py. applied from this path by the target's create
+# script, so a cluster rebuild re-creates it: nothing here is hand-applied
+# state. the base is kube/base; every difference is a patch below, visible
+# in one file rather than a diverged copy.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ingestd.yaml
+  - openskyd.yaml
+  - weatherd.yaml
+  - gibsd.yaml
+  # the environment-neutral base, corvid's route included
+  - ../base
+namespace: ${NAMESPACE}
+# THE COMMIT IS FILLED AT APPLY, NEVER COMMITTED. Every kingfisher image in the
+# base and the daemons takes this tag; bin/roll.sh (and deployd) substitute
+# ${COMMIT} with the sha bin/build.sh just built and tagged. A render that named
+# a commit would be a lie the moment the next build landed, and a mutable :dev
+# tag names nothing. The token is shared with flipr.
+images:
+  - name: kingfisher
+    newTag: "${COMMIT}"
+configMapGenerator:
+  # the kingfisher dashboard, repo-born. Inert until infrastructure adds
+  # grafana's dashboard-provisioning mount; appears automatically after.
+  - name: kingfisher-dashboard
+    namespace: ${NAMESPACE}
+    options:
+      disableNameSuffixHash: true
+      labels:
+        grafana_dashboard: "1"
+    files:
+      - dashboard-kingfisher.json
+
+patches:
+  - path: deployment-patch.yaml
+    target:
+      kind: Deployment
+      name: kingfisher
+  - path: ingressroute-patch.yaml
+    target:
+      kind: IngressRoute
+      name: kingfisher
+  - path: ingressroute-corvid-patch.yaml
+    target:
+      kind: IngressRoute
+      name: corvid

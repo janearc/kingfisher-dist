@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+// kingfisher.compose.v1 -- server-side compositing over heterogeneous layers.
+//
+// kingfisher does compositing and interpolation on
+// weird non-normalised data, navigating different hex resolutions. corvid and
+// peacock are display layers over it.
+//
+// The semantics are PROMOTED from corvid's stackview, which proved them in the
+// browser -- per-layer normalisation ("averaging ranks, not dollars against
+// minutes"), coverage gating, one-vote-per-layer resolution folding, and a
+// combiner vocabulary. Nothing here is invented; it is the working prototype
+// lifted into the substrate so every frontend gets it from the service.
+//
+// Two corrections over the prototype, both driven by the catalogue:
+//   - normalisation uses the layer's DECLARED Domain, not the loaded data, so
+//     the ramp cannot shift with extent or vintage;
+//   - the resolution fold follows LayerKind (intensive=mean, extensive=sum);
+//     stackview folded everything by mean, which silently deflates counts.
+
+package kingfisher.compose.v1;
+
+import "kingfisher/map/v1/map.proto";
+
+// A NAMED, STORED composite -- the "function that yields a layer you can
+// label". Owning these server-side is what makes a composite shareable
+// between corvid, peacock and anything after.
+message LayerDefinition {
+  string id = 1;                 // TAXONOMY: naming scheme
+  string label = 2;
+  repeated Input inputs = 3;
+  Combiner combiner = 4;
+  // the formula, when combiner = COMBINER_EXPRESSION. Same variable model
+  // stackview proved: v.<layer_id> is the normalised 0..1 value, w weights,
+  // n covering-layer count. e.g. "v.density * (1 - v.depth)" -- depth as
+  // negative heat for density. The evaluation language is deliberately
+  // undecided here ("a rudimentary language... or something facile
+  // like tcl"); the CONTRACT only promises the variable model.
+  string expression = 5;
+  // a cell counts only when at least this many inputs cover it, so sparse
+  // coverage cannot quietly read as a low score.
+  uint32 min_coverage = 6;
+  // clip to a hotness band; finding WHERE the answer is, not that there is one
+  double band_lo = 7;
+  double band_hi = 8;
+}
+
+message Input {
+  string layer_id = 1;
+  double weight = 2;
+  bool invert = 3;               // depth-as-negative-heat without a formula
+  string vintage_id = 4;         // pinned per input: CROSS-ERA compositing is
+                                 // a stated feature, so the era is addressable
+}
+
+enum Combiner {
+  COMBINER_UNSPECIFIED = 0;      // refuse; never guess a combine
+  COMBINER_MEAN = 1;             // hot on average
+  COMBINER_MIN = 2;              // hot on EVERY layer; the arbitrage finder
+  COMBINER_MAX = 3;              // hot on any layer
+  COMBINER_EXPRESSION = 4;       // the formula
+}
+
+service ComposeService {
+  rpc ListDefinitions(ListDefinitionsRequest) returns (ListDefinitionsResponse);
+  rpc PutDefinition(PutDefinitionRequest) returns (PutDefinitionResponse);
+  // evaluate a definition over an extent at a resolution. The result grid is
+  // the COARSEST resolution among inputs actually combined (never among
+  // inputs merely defined -- stackview's forty-blobs lesson), each input
+  // folded to that grid FIRST by its LayerKind, one vote per layer per cell.
+  rpc Compose(ComposeRequest) returns (ComposeResponse);
+}
+
+message ListDefinitionsRequest {}
+message ListDefinitionsResponse { repeated LayerDefinition definitions = 1; }
+message PutDefinitionRequest { LayerDefinition definition = 1; }
+message PutDefinitionResponse { string id = 1; }
+
+message ComposeRequest {
+  string definition_id = 1;
+  kingfisher.map.v1.ChunkRef extent = 2;  // the ancestor cell + res addressing
+}
+message ComposeResponse {
+  uint32 res = 1;
+  repeated string h = 2;
+  repeated double hot = 3;       // normalised 0..1 after band clip
+  uint32 inputs_combined = 4;
+  // every response says what it was computed FROM: the vintage per input,
+  // so a cross-era composite is labelled rather than silent.
+  map<string, string> input_vintages = 5;
+}

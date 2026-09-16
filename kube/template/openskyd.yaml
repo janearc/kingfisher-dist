@@ -1,0 +1,97 @@
+# kingfisher-openskyd -- the sky, polled. Same image as kingfisher, its
+# own pod: a background poll loop does not belong in the serving pod's
+# request-handling thread, same argument as ingestd's own separate pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kingfisher-openskyd
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: kingfisher-openskyd
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kingfisher-openskyd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kingfisher-openskyd
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15023"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: openskyd
+          image: kingfisher:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/app/openskyd.py"]
+          ports:
+            - name: http
+              containerPort: 15023
+          env:
+            - name: KINGFISHER_SERVICE_NAME
+              value: kingfisher-openskyd
+            - name: OPENSKYD_OUT
+              value: /maps/flights
+            - name: KINGFISHER_FLIPR_URL
+              value: "http://flipr.flipr"
+            - name: KINGFISHER_KAFKA_BOOTSTRAP
+              value: "kafka.${NAMESPACE}:9092"
+            - name: KINGFISHER_SCHEMA_REGISTRY
+              value: "http://schema-registry.${NAMESPACE}:8081"
+          volumeMounts:
+            # the ONE writer under maps/: openskyd owns flights/, the
+            # serving pod reads it read-only -- same split as ingested/
+            - name: maps-flights
+              mountPath: /maps/flights
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+      volumes:
+        - name: maps-flights
+          hostPath:
+            path: ${DATA_ROOT}/maps/flights
+            type: DirectoryOrCreate
+---
+# nobody has no api (mitigation-1, 2026-08-28, enclave audit): same gap as
+# ingestd's, closed the same way.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kingfisher-openskyd
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: kingfisher-openskyd
+spec:
+  selector:
+    app.kubernetes.io/name: kingfisher-openskyd
+  ports:
+    - name: http
+      port: 15023
+      targetPort: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: kingfisher-openskyd
+  namespace: ${NAMESPACE}
+spec:
+  entryPoints: [web]
+  routes:
+    # both names answer, same reasoning as ingestd's route -- see its comment.
+    - match: Host(`openskyd.test`) || Host(`kingfisher-openskyd.test`)
+      kind: Rule
+      services:
+        - name: kingfisher-openskyd
+          port: 15023

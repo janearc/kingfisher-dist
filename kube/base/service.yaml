@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kingfisher
+  namespace: fleet
+  labels:
+    app.kubernetes.io/name: kingfisher
+    app.kubernetes.io/part-of: fleet
+spec:
+  # ClusterIP, no NodePort and no hostPort: traefik is the only edge, and a
+  # second way in is a second thing to reason about.
+  selector:
+    app.kubernetes.io/name: kingfisher
+  ports:
+    - name: http
+      port: 15021
+      targetPort: http

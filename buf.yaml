@@ -1,0 +1,14 @@
+version: v2
+modules:
+  - path: proto
+  # vendored consumer contract: what ingestd/openskyd consume (flipr's
+  # FliprService), not what kingfisher itself serves. gen.sh builds the
+  # serving pod's /api descriptor from the proto module alone -- this one
+  # backs the daemons' own /api, same split as dodo's.
+  - path: vendor/proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+# kingfisher -- the librarian, from a terminal.
+#
+# WHY THIS EXISTS. DiscoveryService has had ListSources, ListDatasets,
+# RefreshIndex, Fetch and GetFetchStatus for a while, and on 2026-08-30 the
+# index held 64 sources and ZERO datasets. The RPCs are caller-driven and
+# there was no caller: the three daemons that reach the network (gibsd,
+# openskyd, weatherd) are each hardwired to one source, and nothing ever
+# walked the catalogue. So kingfisher looked like it was ignoring its own
+# flipr flags -- fetch.usgs has been true this whole time -- when in fact
+# the gate was fine and no traffic ever arrived at it.
+#
+# This is that caller. It is a thin client and holds no logic of its own:
+# every decision (what is adapted, what is gated, what is held) stays in
+# kingfisher, which is the only thing that should know.
+#
+# THE SHAPE IS THE POINT. Ids go to stdout one per line, everything else to
+# stderr, so the composition works as written:
+#
+#     kingfisher index usgs --region sfbay
+#     kingfisher get $(kingfisher search /lidar/)
+#
+# Env: KINGFISHER_URL (default http://kingfisher.test) -- a NAME, never an
+# address and port.
+#
+# IT IS ALSO THE SERVICE'S CONTROL SCRIPT. every service here leaves one
+# in the operator's init directory that takes the
+# standard verbs and works when Claude is not around; bin/install.sh links
+# this file there. These verbs need kubectl and stdlib Python, nothing else:
+#
+#     kingfisher status        one line per workload: pods, ready, commit, health
+#     kingfisher health        the raw /health of all five
+#     kingfisher start         scale the five deployments to one
+#     kingfisher stop          scale them to zero
+#     kingfisher restart       rollout restart, SAME image -- new code is bin/roll.sh
+#     kingfisher logs [name]   follow one deployment's log
+#
+# `status` used to mean one fetch ticket; that is `kingfisher ticket` now.
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("KINGFISHER_URL", "http://kingfisher.test").rstrip("/")
+
+# Named windows, because nobody types a bbox twice. This is the flat, useful
+# half of the place hierarchy the map contract is growing (world -> countries
+# -> us -> california -> sfbay); when kingfisher.map.v1 grows Region these
+# become its coarse cells and this table goes away. Until then a short list
+# beats a wiki page. w, s, e, n.
+REGIONS = {
+    "sfbay":      (-123.10, 36.90, -121.20, 38.50),
+    "california": (-124.48, 32.53, -114.13, 42.01),
+    "cascadia":   (-124.80, 41.99, -116.90, 49.00),
+    "us":         (-125.00, 24.40,  -66.90, 49.40),
+    "world":      (-180.00, -85.00, 180.00,  85.00),
+}
+
+
+# the five workloads and the names they answer to. kubectl for the pods,
+# the hostnames for health -- never an address and port.
+NAMESPACE = os.environ.get("KINGFISHER_NAMESPACE", "kingfisher")
+CONTEXT = os.environ.get("KINGFISHER_CONTEXT", f"k3d-{NAMESPACE}")
+WORKLOADS = [
+    ("kingfisher",          "kingfisher.test"),
+    ("kingfisher-ingestd",  "ingestd.test"),
+    ("kingfisher-gibsd",    "gibsd.test"),
+    ("kingfisher-openskyd", "openskyd.test"),
+    ("kingfisher-weatherd", "weatherd.test"),
+]
+
+
+def die(msg, code=1):
+    print(f"kingfisher: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def note(msg):
+    # every human-facing line goes to stderr so stdout stays composable
+    print(msg, file=sys.stderr)
+
+
+def _http(path, body=None, timeout=60):
+    url = f"{BASE}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method="POST" if data is not None else "GET",
+        headers={"content-type": "application/json"} if data is not None else {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        die(f"{url} answered {e.code}: {detail}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        die(f"cannot reach kingfisher at {BASE}: {e}\n"
+            f"            (set KINGFISHER_URL if it answers somewhere else)")
+
+
+def rpc(method, body, timeout=60):
+    return _http(f"/kingfisher.discovery.v1.DiscoveryService/{method}", body, timeout)
+
+
+def catalogue():
+    """Sources and datasets in one read. Cheap, carries no flag."""
+    return _http("/discovery")
+
+
+def as_regex(pattern):
+    # accept /foo/ as well as foo, because the ask was written with slashes.
+    #
+    # SMARTCASE, and the bare form used to differ from the slash form: /marble/
+    # came out case-SENSITIVE and silently failed to find "Black Marble", which
+    # is a bad way to learn that your search syntax has two dialects. Now both
+    # forms ignore case until the pattern itself contains a capital, which is
+    # the ripgrep and vim convention and is what anyone typing a lowercase
+    # word actually means.
+    m = re.fullmatch(r"/(.*)/([a-z]*)", pattern)
+    body = m.group(1) if m else pattern
+    f = 0 if any(c.isupper() for c in body) else re.IGNORECASE
+    try:
+        return re.compile(body, f)
+    except re.error as e:
+        die(f"bad pattern {pattern!r}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# commands
+
+
+def cmd_search(args):
+    rx = as_regex(args.pattern)
+    cat = catalogue()
+    ds = [d for d in cat.get("datasets", [])
+          if rx.search(d.get("id", "")) or rx.search(d.get("title", ""))]
+    srcs = [s for s in cat.get("sources", [])
+            if rx.search(s.get("id", "")) or rx.search(s.get("title", ""))]
+
+    # datasets are what --get takes, so they own stdout
+    for d in ds:
+        print(d["id"])
+
+    if ds:
+        note(f"-- {len(ds)} dataset(s) matched; ids on stdout")
+    if not ds and srcs:
+        note(f"-- no DATASETS matched, but {len(srcs)} source(s) did:")
+        for s in srcs[:20]:
+            note(f"     {s['id']:16} {s.get('title','')}")
+        if len(srcs) > 20:
+            note(f"     ... and {len(srcs) - 20} more")
+        note("-- a source is a place to look, not a thing to fetch. Index it first:")
+        note(f"     kingfisher index {srcs[0]['id']} --region sfbay")
+    if not ds and not srcs:
+        note(f"-- nothing matched {args.pattern}")
+        return 1
+    return 0
+
+
+def cmd_sources(args):
+    cat = catalogue()
+    rx = as_regex(args.pattern) if args.pattern else None
+    rows = [s for s in cat.get("sources", [])
+            if not rx or rx.search(s["id"]) or rx.search(s.get("title", ""))]
+    held = {}
+    for d in cat.get("datasets", []):
+        held[d["source_id"]] = held.get(d["source_id"], 0) + 1
+    note(f"{len(rows)} source(s):")
+    for s in sorted(rows, key=lambda x: x["id"]):
+        bits = []
+        if s.get("paid"):
+            bits.append("paid")
+        elif s.get("expensive"):
+            bits.append("big")
+        if s.get("country"):
+            bits.append(s["country"])
+        n = held.get(s["id"], 0)
+        print(f"{s['id']:16} {(' [' + ','.join(bits) + ']') if bits else '':14}"
+              f"{('%d indexed' % n) if n else '':12} {s.get('title','')}")
+    return 0
+
+
+def cmd_index(args):
+    if args.region:
+        if args.region not in REGIONS:
+            die(f"unknown region {args.region!r}; known: {', '.join(sorted(REGIONS))}")
+        bbox = list(REGIONS[args.region])
+    elif args.bbox:
+        try:
+            bbox = [float(x) for x in args.bbox.split(",")]
+        except ValueError:
+            die("--bbox wants four numbers: w,s,e,n")
+        if len(bbox) != 4:
+            die("--bbox wants four numbers: w,s,e,n")
+    else:
+        bbox = []
+
+    note(f"asking {args.source} for its catalogue"
+         + (f" matching {args.match!r}" if args.match else "")
+         + (f" over {args.region or args.bbox}" if bbox else "") + " ...")
+    body = {"sourceId": args.source, "limit": args.limit}
+    if bbox:
+        body["bbox"] = bbox
+    if args.match:
+        body["query"] = args.match
+    resp = rpc("RefreshIndex", body, timeout=180)
+
+    n = int(resp.get("indexed", 0))
+    if n == 0:
+        # kingfisher answers honestly in three different ways here and the
+        # difference matters, so say which one happened rather than "0".
+        note(f"-- {args.source} indexed nothing.")
+        note("   Either it has no adapter yet (most sources are registered but")
+        note("   unfetchable -- kingfisher says so rather than pretending), its")
+        note("   flipr flags are off (fetch.enabled and fetch." + args.source + "),")
+        note("   or the window genuinely holds no data.")
+        return 1
+    note(f"-- {n} dataset(s) indexed from {args.source}")
+    note(f"   kingfisher search /{args.source}/     to see them")
+    return 0
+
+
+def cmd_ls(args):
+    cat = catalogue()
+    rows = cat.get("datasets", [])
+    if args.source:
+        rows = [d for d in rows if d.get("source_id") == args.source]
+    if not rows:
+        note("the index is empty." if not args.source else
+             f"nothing indexed from {args.source}.")
+        note("   kingfisher sources          to see what is registered")
+        note("   kingfisher index usgs --region sfbay")
+        return 1
+    by = {}
+    for d in rows:
+        by.setdefault(d.get("state", "FETCH_STATE_UNSPECIFIED"), []).append(d)
+    for state in sorted(by):
+        note(f"{state.replace('FETCH_STATE_', '').lower()}: {len(by[state])}")
+        for d in sorted(by[state], key=lambda x: x["id"])[:args.limit]:
+            mb = (d.get("bytes_estimate") or 0) / 1e6
+            print(f"{d['id']:52} {mb:9.1f}MB  {d.get('title','')[:60]}")
+        if len(by[state]) > args.limit:
+            note(f"   ... and {len(by[state]) - args.limit} more"
+                 f" (--limit {len(by[state])} for all)")
+    return 0
+
+
+def cmd_get(args):
+    if not args.dataset:
+        note("nothing to get. Pipe ids in, or name them:")
+        note("   kingfisher get $(kingfisher search /lidar/)")
+        return 1
+    tickets = []
+    for dsid in args.dataset:
+        resp = rpc("Fetch", {"datasetId": dsid})
+        t = resp.get("ticket")
+        if not t:
+            # Fetch refuses with a REASON -- a flag that is off, an unknown
+            # id, a dataset with no download url. Print it; a bare failure
+            # count is the thing that makes this feel mysterious.
+            note(f"[refused] {dsid}: {json.dumps(resp)[:200]}")
+            continue
+        tickets.append((t, dsid))
+        note(f"[fetching] {dsid}  ticket {t}")
+    if not tickets:
+        return 1
+    if args.no_wait:
+        for t, _ in tickets:
+            print(t)
+        return 0
+
+    # follow to completion. Backoff, because polling a long download every
+    # second is a busy loop that teaches kingfisher nothing.
+    pending = dict(tickets)
+    delay, done, failed = 1.0, [], []
+    while pending:
+        time.sleep(delay)
+        delay = min(delay * 1.6, 15.0)
+        for t in list(pending):
+            rec = rpc("GetFetchStatus", {"ticket": t}).get("record", {})
+            state = rec.get("state", "FETCH_STATE_UNSPECIFIED")
+            if state == "FETCH_STATE_HELD":
+                note(f"[held] {pending[t]}")
+                done.append(pending.pop(t))
+            elif state == "FETCH_STATE_FAILED":
+                note(f"[failed] {pending[t]}")
+                failed.append(pending.pop(t))
+    for d in done:
+        print(d)
+    note(f"-- {len(done)} held, {len(failed)} failed")
+    if done:
+        note("   the bytes are in the spool; ingestd picks them up from there.")
+    return 0 if not failed else 1
+
+
+def _getkey():
+    """One keypress, raw, no Enter. Restores the terminal whatever happens."""
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _renderable():
+    """Every shelved dataset whose payload is cells."""
+    try:
+        dirs = _http("/ingested/").get("directories", [])
+    except Exception:
+        return []
+    out = []
+    for d in dirs:
+        m = _manifest(d)
+        if m and m.get("content") == "cells.json":
+            out.append(d.rstrip("/"))
+    return out
+
+
+def cmd_browse(args):
+    """Flip through frames with the spacebar.
+
+    A FRAME IS A FRAME. Today they are (dataset, layer) pairs; the moment
+    kingfisher shelves the same layer at several vintages they are years, and
+    nothing here changes -- which is the whole reason time-aligned data is
+    free animation rather than a feature.
+    """
+    # NO ARGUMENTS MEANS EVERYTHING RENDERABLE. Having to know an id before
+    # you can look at anything is the thing that made the shelf feel closed;
+    # `kingfisher browse` with no arguments should show you what you have.
+    targets = args.dataset or _renderable()
+    if not targets:
+        note("nothing on the shelf carries cells yet -- fetch a lidar tile first.")
+        return 1
+    frames = []
+    for ds in targets:
+        cells = _load_cells(ds)
+        if not cells:
+            continue
+        keys = sorted({k for r in list(cells.values())[:200] if isinstance(r, dict) for k in r})
+        for k in (args.layers.split(",") if args.layers else keys):
+            k = k.strip()
+            if k in keys:
+                frames.append((ds, k, cells))
+    if not frames:
+        note("nothing to browse.")
+        return 1
+
+    if not sys.stdin.isatty():
+        # piped: no keys to wait for, so just draw them all in order
+        for ds, layer, cells in frames:
+            _draw(cells, layer, args, header=f"{ds}  {layer}")
+        return 0
+
+    i = 0
+    while True:
+        # home + clear-below rather than a full clear: no flash between
+        # frames, which matters when the point is to compare them
+        sys.stdout.write("\x1b[H\x1b[J")
+        ds, layer, cells = frames[i]
+        _draw(cells, layer, args,
+              header=f"[{i + 1}/{len(frames)}]  {ds}  {layer}"
+                     "   space/n next \u00b7 p back \u00b7 q quit")
+        k = _getkey()
+        if k in ("q", "\x03", "\x1b"):
+            sys.stdout.write("\x1b[0m\n")
+            return 0
+        if k == "p":
+            i = (i - 1) % len(frames)
+        else:
+            i = (i + 1) % len(frames)
+
+
+def cmd_ticket(args):
+    rec = rpc("GetFetchStatus", {"ticket": args.ticket}).get("record", {})
+    if not rec:
+        die(f"no such ticket {args.ticket}")
+    print(json.dumps(rec, indent=1))
+    return 0
+
+
+
+
+# ---------------------------------------------------------------------------
+# the terminal renderer
+
+
+# 24-bit colour, half blocks. A terminal cell is about twice as tall as it is
+# wide, so drawing one row per cell squashes the world; U+2584 (lower half
+# block) with a background colour behind it puts TWO map rows in one character
+# row -- foreground paints the bottom, background the top -- and the aspect
+# comes out roughly square.
+UPPER_LOWER = "\u2584"
+
+
+def _ramp(t):
+    # cold to hot, through the same slots the map uses: blue, cyan, green,
+    # amber, red. Linear between stops; nobody needs a colour science library
+    # to make a terminal look good.
+    stops = [(0x2b, 0x4b, 0xd9), (0x00, 0xc8, 0xe0), (0x3f, 0xd0, 0x6b),
+             (0xe8, 0xa3, 0x3d), (0xe0, 0x4f, 0x4f)]
+    t = max(0.0, min(1.0, t))
+    x = t * (len(stops) - 1)
+    i = int(x)
+    if i >= len(stops) - 1:
+        return stops[-1]
+    a, b, f = stops[i], stops[i + 1], x - i
+    return tuple(int(a[k] + (b[k] - a[k]) * f) for k in range(3))
+
+
+def _cells_from_url(url):
+    """Cells from any door, not just kingfisher's shelf.
+
+    Two shapes, because both already exist in the estate and neither is
+    wrong: a JSON object of cell -> value, and a bare list of cell ids one
+    per line. The second is a COVERAGE map -- corvid's eta origins are
+    exactly that, 8,255 res-8 cells naming the area the travel-time table
+    knows -- so every cell gets value 1 and what you see is the footprint.
+    """
+    req = urllib.request.Request(url, headers={"accept": "application/json, text/plain"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        raw = r.read()
+    txt = raw.decode("utf-8", "replace").strip()
+    if txt.startswith("{"):
+        d = json.loads(txt)
+        cells = d.get("cells", d)
+        return {k: (v if isinstance(v, (int, float)) else 1) for k, v in cells.items()}
+    out = {}
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.replace(",", " ").split()
+        out[parts[0]] = float(parts[1]) if len(parts) > 1 else 1.0
+    return out
+
+
+def cmd_tombstone(args):
+    # an operator's word: never fetch these again, with the reason written
+    # down; or take the word back with --revive. ids come from the arguments,
+    # from stdin as '-', or from the .meta.json files in a directory
+    # (--from-dead spool/dead), whose state is rewritten in place so the
+    # dead-letter file reads as the tombstone it now is.
+    ids = [i for i in args.ids if i != "-"]
+    if "-" in args.ids:
+        ids += [l.strip() for l in sys.stdin if l.strip()]
+    metas = {}
+    if args.from_dead:
+        for name in sorted(os.listdir(args.from_dead)):
+            if name.endswith(".meta.json"):
+                p = os.path.join(args.from_dead, name)
+                with open(p) as f:
+                    metas[json.load(f)["id"]] = p
+        ids += list(metas)
+    if not ids:
+        die("nothing to tombstone: give ids, '-' for stdin, or --from-dead DIR")
+    if not args.revive and not args.reason:
+        die("a tombstone needs --reason")
+    for i in ids:
+        rec = rpc("Tombstone", {"datasetId": i, "reason": args.reason or "", "revive": args.revive}).get("record", {})
+        print(f"{rec.get('state', '?'):24} {i}  {rec.get('tombstonedAt', '')}  {rec.get('title', '')[:60]}")
+        if i in metas:
+            with open(metas[i]) as f:
+                m = json.load(f)
+            m["state"] = rec.get("state", m.get("state"))
+            if args.revive:
+                m.pop("tombstone_reason", None); m.pop("tombstoned_at", None)
+            else:
+                m["tombstone_reason"] = args.reason; m["tombstoned_at"] = rec.get("tombstonedAt", "")
+            tmp = metas[i] + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(m, f, indent=1)
+            os.replace(tmp, metas[i])
+
+
+def cmd_render(args):
+    """Draw a hex dataset in the terminal, in colour."""
+    if args.url:
+        cells = _cells_from_url(args.url)
+        if not cells:
+            die(f"no cells at {args.url}")
+        return _draw(cells, args.layer, args, header=args.url)
+    if not args.dataset:
+        die("name a shelved dataset, or pass --url")
+    cells = _load_cells(args.dataset)
+    if not cells:
+        return 1
+    return _draw(cells, args.layer, args)
+
+
+def _draw(cells, layer, args, header=None):
+    """One frame. Shared by render and browse so they cannot drift apart."""
+    import math
+    import shutil
+
+    rows = []
+    for cell, row in cells.items():
+        v = row.get(layer) if isinstance(row, dict) else row
+        if v is None:
+            continue
+        rows.append((cell, float(v)))
+    if not rows:
+        note(f"no cell carries {layer!r}. Layers here: "
+             + ", ".join(sorted({k for r in list(cells.values())[:50]
+                                 if isinstance(r, dict) for k in r})))
+        return 1
+
+    try:
+        import h3
+    except ImportError:
+        die("this needs h3: run it as `uv run bin/kingfisher ...`")
+
+    pts = []
+    for cell, v in rows:
+        lat, lon = h3.cell_to_latlng(cell)
+        pts.append((lon, lat, v))
+
+    w = args.width or max(40, min(200, shutil.get_terminal_size((100, 40)).columns - 2))
+    # equirectangular, corrected by cos(lat) so the aspect is honest at this
+    # latitude. Web mercator would be wrong here: it is the projection for
+    # SQUARE tiles, and a terminal cell is not square.
+    lons = [p[0] for p in pts]
+    lats = [p[1] for p in pts]
+    w0, w1 = min(lons), max(lons)
+    s0, s1 = min(lats), max(lats)
+    midlat = math.radians((s0 + s1) / 2)
+    dx = max(1e-9, (w1 - w0) * math.cos(midlat))
+    dy = max(1e-9, (s1 - s0))
+    rowsmax = max(6, shutil.get_terminal_size((100, 40)).lines - 4)
+    h = max(4, min(rowsmax * 2, int(round(w * dy / dx / 2)) * 2))
+
+    acc = {}
+    for lon, lat, v in pts:
+        cx = int((lon - w0) * math.cos(midlat) / dx * (w - 1))
+        cy = int((s1 - lat) / dy * (h - 1))
+        a = acc.setdefault((cy, cx), [0.0, 0])
+        a[0] += v
+        a[1] += 1
+
+    vals = [a[0] / a[1] for a in acc.values()]
+    lo, hi = min(vals), max(vals)
+    # A FLAT SOURCE IS A COVERAGE MAP, not an empty one. When every cell holds
+    # the same value there is no magnitude to show, only presence -- and
+    # normalising a constant to zero rendered the whole thing blank, which is
+    # exactly backwards: every one of those cells is data. corvid's eta
+    # origins are 8,255 identical 1s naming the area the table knows.
+    flat = (hi - lo) < 1e-12
+    span = 1.0 if flat else (hi - lo)
+
+    def at(y, x):
+        a = acc.get((y, x))
+        if a is None:
+            return None
+        return 1.0 if flat else (a[0] / a[1] - lo) / span
+
+    # ONE RAMP, DEFINED ONCE, in textmap. It used to lead with a space here,
+    # which drew the bottom of every scale exactly like ground nobody
+    # surveyed. Two renderers each holding their own copy is how that survived
+    # -- the colour path obeyed the absence rule and the ascii path did not.
+    RAMP = _textmap().RAMP
+    out = []
+    for y in range(0, h, 2):
+        line = []
+        if args.ascii:
+            for x in range(w):
+                top, bot = at(y, x), at(y + 1, x)
+                vs = [v for v in (top, bot) if v is not None]
+                line.append(" " if not vs else
+                            RAMP[min(len(RAMP) - 1, int(sum(vs) / len(vs) * len(RAMP)))])
+            out.append("".join(line))
+            continue
+        # ESCAPES ONLY WHEN THE COLOUR CHANGES. Set-and-reset per character
+        # made a 96-column frame 106KB, which is most of a megabyte for one
+        # page of map and visibly slow to scroll.
+        cfg = cbg = None
+        for x in range(w):
+            top, bot = at(y, x), at(y + 1, x)
+            if top is None and bot is None:
+                # ABSENCE IS BLANK, never a dark colour. A cell nobody
+                # surveyed and one measuring zero are different facts, and the
+                # rule holds in every renderer or in none.
+                if cbg is not None:
+                    line.append("\x1b[49m")
+                    cbg = None
+                line.append(" ")
+                continue
+            bg = _ramp(top) if top is not None else None
+            fg = _ramp(bot) if bot is not None else None
+            if bg != cbg:
+                line.append("\x1b[49m" if bg is None else f"\x1b[48;2;{bg[0]};{bg[1]};{bg[2]}m")
+                cbg = bg
+            if fg is None:
+                line.append(" ")
+            else:
+                if fg != cfg:
+                    line.append(f"\x1b[38;2;{fg[0]};{fg[1]};{fg[2]}m")
+                    cfg = fg
+                line.append(UPPER_LOWER)
+        line.append("\x1b[0m")
+        out.append("".join(line))
+
+    if header:
+        note(header)
+    if getattr(args, "draw", 0):
+        # PAINTED, not printed: the map arrives a row at a time so you can
+        # watch it build. The terminal's version of the elevation transitions
+        # the web pane does, and it costs one sleep.
+        import time as _time
+        for line in out:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+            _time.sleep(args.draw)
+    else:
+        print("\n".join(out))
+
+    note(f"-- {len(rows):,} cells, {layer}, {lo:.2f}..{hi:.2f}"
+         f"  ({w}x{h} at {s0:.3f}..{s1:.3f}N {w0:.3f}..{w1:.3f}E)")
+    return 0
+
+
+def _load_cells(dataset):
+    """cells.json for a shelved dataset, by id or by 'any lidar'."""
+    base = f"/ingested/{dataset}/cells.json"
+    try:
+        return _http(base).get("cells")
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    # not found by that id: list what IS renderable and say so
+    try:
+        dirs = _http("/ingested/").get("directories", [])
+    except Exception:
+        dirs = []
+    have = []
+    for d in dirs:
+        try:
+            m = _http(f"/ingested/{d}manifest.json")
+            if m.get("content") == "cells.json":
+                have.append(d.rstrip("/"))
+        except Exception:
+            continue
+    note(f"no cells for {dataset!r}.")
+    if have:
+        note("renderable datasets:")
+        for h in have:
+            note("   " + h)
+    else:
+        note("nothing on the shelf carries cells yet -- fetch a lidar tile first.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# the bench
+
+
+def _textmap():
+    """The renderer library, which lives beside the daemons, not in bin/."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        import textmap
+    except ImportError:
+        die("cannot import textmap.py from " + root)
+    return textmap
+
+
+# MEMOISED because the shelf holds ~400 datasets and the selection path walks
+# it more than once -- list what is renderable, then match a regex over the
+# titles. Without this that is 800 round trips to answer one question.
+_MANIFESTS = {}
+
+
+def _manifest(ds):
+    """A shelved dataset's manifest, or None. Cached for the process."""
+    ds = ds.rstrip("/")
+    if ds not in _MANIFESTS:
+        try:
+            _MANIFESTS[ds] = _http(f"/ingested/{ds}/manifest.json")
+        except SystemExit:
+            raise
+        except Exception:
+            _MANIFESTS[ds] = None
+    return _MANIFESTS[ds]
+
+
+def _shelf(bbox=None, budget=None):
+    """kingfisher's price for a window: what is there, and what it would cost.
+
+    MANIFESTS ONLY on the far side, so this is cheap enough to call before
+    every decision -- which is the point of a price that is not a delivery.
+    """
+    q = []
+    if bbox:
+        q.append("bbox=" + ",".join(f"{v:.6f}" for v in bbox))
+    if budget:
+        q.append(f"budget={int(budget)}")
+    return _http("/shelf" + ("?" + "&".join(q) if q else ""))
+
+
+def _cells(bbox, budget, layer=None):
+    """Cells for a window, already folded to fit the budget.
+
+    THE BENCH NAMES NO RESOLUTION. Only kingfisher knows what is shelved, so
+    only kingfisher can pick the finest resolution that fits; a terminal that
+    guessed would guess the way dodo did, and dodo was OOM-killed for it.
+    """
+    q = ["bbox=" + ",".join(f"{v:.6f}" for v in bbox), f"budget={int(budget)}"]
+    if layer:
+        q.append("layer=" + layer)
+    return _http("/cells?" + "&".join(q))
+
+
+def _union(entries):
+    """The window that holds everything the shelf reported."""
+    boxes = [e["bbox"] for e in entries if e.get("bbox")]
+    if not boxes:
+        return None
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+def _covers(outer, inner):
+    """Is the fetched window still big enough for what is on screen?"""
+    if not outer:
+        return False
+    return (outer[0] <= inner[0] and outer[1] <= inner[1]
+            and outer[2] >= inner[2] and outer[3] >= inner[3])
+
+
+def _grown(bbox, factor=1.6):
+    """Fetch a window bigger than the screen, so a small pan is not a request.
+
+    Without this every keypress is an HTTP call. With it, panning inside the
+    margin is free and only leaving it costs anything.
+    """
+    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    hw, hh = (bbox[2] - bbox[0]) / 2 * factor, (bbox[3] - bbox[1]) / 2 * factor
+    return [cx - hw, cy - hh, cx + hw, cy + hh]
+
+
+# what each key does, in one place, so the help line and the loop cannot
+# disagree about it
+BENCH_KEYS = ("hjkl pan · HJKL page · i/o (or =/-) zoom · <> layer · "
+              "g globe · f fit · a ascii · r refetch · q quit")
+
+
+def cmd_bench(args):
+    """An interactive bench for the text renderer: a window and a budget.
+
+    THE TERMINAL IS THE TEST CONSUMER. Its budget is the one budget in the
+    estate that is exact rather than guessed: a frame is cols x rows x 2
+    pixels, and every cell past that averages into a bin that already holds
+    one. So the bench asks for exactly what it can draw and no more -- about
+    one cell in six hundred of what the shelf holds.
+    """
+    tm = _textmap()
+    cols, rows = _bench_grid(args)
+    budget = args.budget or (cols * rows * 2)
+
+    if args.bbox:
+        try:
+            window = [float(x) for x in args.bbox.split(",")]
+            if len(window) != 4:
+                raise ValueError
+        except ValueError:
+            die("--bbox wants four numbers: w,s,e,n")
+    elif args.region:
+        if args.region not in REGIONS:
+            die(f"unknown region {args.region!r}; known: {', '.join(sorted(REGIONS))}")
+        window = list(REGIONS[args.region])
+    else:
+        # NO WINDOW MEANS THE WHOLE SHELF, which is a fine question to ask and
+        # usually a bad picture: with New York shelved beside California it
+        # draws two dots and a blank continent. That IS the answer, and seeing
+        # it is what makes the window argument obvious.
+        window = _union(_shelf(budget=budget).get("shelf", []))
+        if not window:
+            die("nothing on the shelf has bounds yet -- ingestd is still "
+                "backfilling, or nothing hexed has landed.")
+
+    note(f"window {['%.4f' % v for v in window]}  budget {budget:,} cells")
+    quote = _shelf(window, budget)
+    note(f"-- {quote['datasets']} dataset(s), {quote['cells_native']:,} cells "
+         f"at res {quote['res_native']}, serving res {quote['res']}")
+    if not quote["datasets"]:
+        die("no shelved dataset overlaps that window")
+
+    def flat():
+        return tm.Viewport.fit(
+            [(window[0], window[1], 0), (window[2], window[3], 0)], cols, rows)
+
+    def ball():
+        # centred on the window, so toggling does not teleport you
+        return tm.Globe((window[0] + window[2]) / 2,
+                        (window[1] + window[3]) / 2, cols, rows)
+
+    vp = ball() if args.globe else flat()
+    mapper = tm.TextMap(ascii_only=args.ascii)
+    fetched, src, res, layers = None, None, quote["res"], []
+    fetched_span = None
+    layer = args.layer
+
+    def rescale():
+        """Pin the colour ramp to EVERYTHING FETCHED, not to what is on screen.
+
+        Per-frame normalisation re-derives lo..hi from the visible cells, so
+        the same ground changes colour as you pan and two frames cannot be
+        compared -- which is the whole point of a map. Pinning it to the
+        fetched set means panning within a fetch is a move, not a repaint.
+        """
+        vals = [row[layer] for row in src.cells.values() if layer in row]
+        mapper.scale = (min(vals), max(vals)) if vals else None
+
+    def refresh(force=False):
+        """Fetch when the screen has left what we hold -- OR when it has shrunk
+        far enough inside it that a refetch would buy resolution.
+
+        THE SECOND HALF WAS MISSING. Zooming in makes the window smaller, so
+        it stays inside the fetched box forever and the coarse cells are simply
+        magnified: res-2 hexagons a thousand times life size, and no request
+        ever made for the finer ones sitting on the shelf.
+        """
+        nonlocal fetched, src, res, layers, layer, fetched_span
+        want = vp.bounds()
+        zoomed_in = fetched_span is not None and vp.span_x < fetched_span * 0.5
+        if not force and _covers(fetched, want) and not zoomed_in:
+            return
+        box = _grown(want)
+        body = _cells(box, budget)
+        res = body["res"]
+        fetched = box
+        fetched_span = vp.span_x
+        src = tm.CellSource("shelf", body.get("cells") or {},
+                            {"point_density": "LAYER_KIND_EXTENSIVE"})
+        layers = src.layers()
+        if layer not in layers and layers:
+            layer = layers[0]
+        rescale()
+
+    refresh(force=True)
+    if not layers:
+        die("that window holds no cells")
+
+    if not sys.stdin.isatty():
+        # no keyboard: one frame and out, so the bench composes in a pipe
+        for line in mapper.frame(src.points(res, layer), vp,
+                                 fill=src.sampler(res, layer)):
+            print(line)
+        return 0
+
+    sys.stdout.write("\x1b[?25l")            # hide the cursor while we paint
+    try:
+        while True:
+            refresh()
+            pts = src.points(res, layer)
+            # FILL, because past a certain zoom a cell is bigger than a pixel
+            # and scattering centres draws confetti instead of a map.
+            lines = mapper.frame(pts, vp, fill=src.sampler(res, layer))
+            w, s, e, n = vp.bounds()
+            sys.stdout.write("\x1b[H\x1b[J")
+            sys.stdout.write("\n".join(lines))
+            sys.stdout.write(
+                f"\n\x1b[0m{layer}  res {res}  budget {budget:,}"
+                f"  {mapper.plotted:,}/{len(pts):,} cells"
+                f"{(' +%s filled' % format(mapper.filled, ',')) if mapper.filled else ''}"
+                f"  {mapper.lo:.1f}..{mapper.hi:.1f}"
+                f"  {cols}x{rows}  [{s:.4f},{w:.4f} {n:.4f},{e:.4f}]\n"
+                f"{BENCH_KEYS}\n")
+            sys.stdout.flush()
+            k = _getkey()
+            if k in ("q", "\x03", "\x1b"):
+                return 0
+            # PAN IS A FRACTION OF THE WINDOW, never a fixed number of
+            # degrees: at every zoom level one press should move about the
+            # same distance across the screen.
+            step = 0.6 if k in "HJKL" else 0.15
+            low = k.lower()
+            if low == "h":
+                vp.pan(-step, 0)
+            elif low == "l":
+                vp.pan(step, 0)
+            elif low == "j":
+                vp.pan(0, -step)
+            elif low == "k":
+                vp.pan(0, step)
+            # ZOOM HAS THREE SPELLINGS AND NONE OF THEM NEED SHIFT. "+" is
+            # shift-equals on a laptop and the combination is exactly the kind
+            # of thing a terminal emulator binds for its own font size, so the
+            # obvious key is the one most likely to never arrive. "=" and "i"
+            # both work, and "o" is the way back out.
+            elif k in ("+", "=", "i"):
+                vp.zoom(1 / 1.4)
+            elif k in ("-", "_", "o"):
+                vp.zoom(1.4)
+            elif k in (">", "."):
+                layer = layers[(layers.index(layer) + 1) % len(layers)]
+                rescale()
+            elif k in ("<", ","):
+                layer = layers[(layers.index(layer) - 1) % len(layers)]
+                rescale()
+            elif k == "r":
+                refresh(force=True)
+            elif k == "f":
+                cols, rows = _bench_grid(args)
+                vp = ball() if isinstance(vp, tm.Globe) else flat()
+                refresh(force=True)
+            elif k == "g":
+                # BALL EARTH. The projections are interchangeable -- both
+                # answer project/unproject/bounds -- so this is a swap, not a
+                # mode. The renderer never learns which one it is holding.
+                vp = flat() if isinstance(vp, tm.Globe) else ball()
+                refresh(force=True)
+            elif k == "a":
+                mapper.ascii_only = not mapper.ascii_only
+    finally:
+        sys.stdout.write("\x1b[0m\x1b[?25h\n")   # colour off, cursor back
+        sys.stdout.flush()
+
+
+def _bench_grid(args):
+    """The character grid: what was asked for, else what the terminal has.
+
+    Three rows are held back for the two status lines and the shell prompt --
+    without that the frame scrolls on every redraw and the map crawls up the
+    screen instead of staying put.
+    """
+    import shutil
+    size = shutil.get_terminal_size((80, 24))
+    cols = args.width or max(20, size.columns - 1)
+    rows = args.height or max(6, size.lines - 3)
+    return cols, rows
+
+
+
+def _kubectl(*args, capture=True):
+    """kubectl against the configured context, or a plain reason why not."""
+    import subprocess
+    # the context is explicit, never whatever kubectl has current: these verbs
+    # must not land on another cluster because a shell was left there
+    cmd = ["kubectl", "--context", CONTEXT, "-n", NAMESPACE, *args]
+    try:
+        r = subprocess.run(cmd, capture_output=capture, text=True, timeout=120)
+    except FileNotFoundError:
+        die("kubectl is not on PATH; the service verbs need it")
+    except subprocess.TimeoutExpired:
+        die("kubectl did not answer in 120s")
+    if r.returncode != 0 and capture:
+        die(f"kubectl {' '.join(args)}: {(r.stderr or '').strip()[:200]}")
+    return r.stdout if capture else ""
+
+
+def _health_of(host):
+    """One daemon's /health as a dict, or a dict saying why not. Never raises:
+    status is the verb you run when things are broken."""
+    try:
+        with urllib.request.urlopen(f"http://{host}/health", timeout=5) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read())
+        except Exception:
+            return {"ok": False, "degraded": [f"http {e.code}"]}
+    except Exception as e:
+        return {"ok": False, "degraded": [f"unreachable: {str(e)[:60]}"]}
+
+
+def cmd_service(args):
+    """The init.claude verbs."""
+    names = [n for n, _ in WORKLOADS]
+    if args.verb in ("start", "stop"):
+        n = "1" if args.verb == "start" else "0"
+        for name in names:
+            _kubectl("scale", f"deploy/{name}", f"--replicas={n}")
+            note(f"{name}: replicas={n}")
+        return 0
+    if args.verb == "restart":
+        for name in names:
+            _kubectl("rollout", "restart", f"deploy/{name}")
+        for name in names:
+            note(_kubectl("rollout", "status", f"deploy/{name}", "--timeout=240s").strip())
+        return 0
+    if args.verb == "logs":
+        if args.name not in names:
+            die(f"unknown workload {args.name!r}; one of: {', '.join(names)}")
+        _kubectl("logs", "-f", f"deploy/{args.name}", capture=False)
+        return 0
+    if args.verb == "health":
+        for name, host in WORKLOADS:
+            print(f"== {name}  ({host})")
+            print(json.dumps(_health_of(host), indent=1))
+        return 0
+    # status: pods from kubectl, posture from /health, one line each
+    pods = {}
+    for line in _kubectl("get", "deploy", *names, "--no-headers").splitlines():
+        parts = line.split()
+        if parts:
+            pods[parts[0]] = parts[1]          # READY column, e.g. 1/1
+    worst = 0
+    for name, host in WORKLOADS:
+        h = _health_of(host)
+        ok = bool(h.get("ok"))
+        worst = max(worst, 0 if ok else 1)
+        reason = "; ".join(h.get("degraded") or []) or h.get("reason") or ""
+        print(f"{name:22s} {pods.get(name, '?/?'):5s} commit={h.get('commit', '?'):8s} "
+              f"{'ok' if ok else 'DEGRADED'}  {reason}")
+    return worst
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="kingfisher", description="the map data librarian, from a terminal")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("search", help="find datasets (and sources) by pattern")
+    p.add_argument("pattern", help="regex, /slashes/ optional; case-insensitive")
+    p.set_defaults(fn=cmd_search)
+
+    p = sub.add_parser("sources", help="what kingfisher can reach")
+    p.add_argument("pattern", nargs="?", help="optional regex")
+    p.set_defaults(fn=cmd_sources)
+
+    p = sub.add_parser("index", help="ask a source for its catalogue")
+    p.add_argument("source")
+    p.add_argument("--region", help="named window: " + ", ".join(sorted(REGIONS)))
+    p.add_argument("--bbox", help="w,s,e,n")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--match", help="narrow the provider's catalogue before the "
+                   "limit bites -- GIBS has ~1000 layers and you want three")
+    p.set_defaults(fn=cmd_index)
+
+    p = sub.add_parser("ls", help="what the index holds")
+    p.add_argument("--source")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_ls)
+
+    p = sub.add_parser("get", help="fetch datasets by id, and wait for them")
+    p.add_argument("dataset", nargs="*")
+    p.add_argument("--no-wait", action="store_true",
+                   help="print tickets and exit instead of following")
+    p.set_defaults(fn=cmd_get)
+
+    p = sub.add_parser("tombstone", help="never fetch these datasets again, with the reason written down (or --revive)")
+    p.add_argument("ids", nargs="*", help="dataset ids; '-' reads ids from stdin")
+    p.add_argument("--reason", help="why, recorded in the index and on any rewritten meta")
+    p.add_argument("--from-dead", metavar="DIR", help="tombstone every .meta.json in DIR and rewrite its state in place")
+    p.add_argument("--revive", action="store_true", help="take the word back: state returns to INDEXED")
+    p.set_defaults(fn=cmd_tombstone)
+    p = sub.add_parser("render", help="draw a hex dataset in the terminal, in colour")
+    p.add_argument("dataset", nargs="?", help="a shelved dataset id (kingfisher ls to see them)")
+    p.add_argument("--url", help="cells from any door: JSON cell->value, or one cell id "
+                   "per line for a coverage footprint")
+    p.add_argument("--layer", default="elevation_surface",
+                   help="which measure to draw (default elevation_surface)")
+    p.add_argument("--width", type=int, help="columns; defaults to your terminal")
+    p.add_argument("--draw", type=float, nargs="?", const=0.06, default=0,
+                   metavar="SEC", help="paint it a row at a time so you can watch "
+                   "it arrive (default 0.06s per row)")
+    p.add_argument("--ascii", action="store_true",
+                   help="a density ramp instead of colour -- survives a pipe or a paste")
+    p.set_defaults(fn=cmd_render)
+
+    p = sub.add_parser("browse", help="flip through frames with the spacebar")
+    p.add_argument("dataset", nargs="*", help="ids, or nothing for everything renderable")
+    p.add_argument("--layers", help="comma-separated; default is every layer the data has")
+    p.add_argument("--width", type=int)
+    p.add_argument("--ascii", action="store_true")
+    p.add_argument("--draw", type=float, nargs="?", const=0, default=0)
+    p.set_defaults(fn=cmd_browse)
+
+    p = sub.add_parser("bench", help="an interactive window over the shelf")
+    p.add_argument("--region", help="a named window: " + ", ".join(sorted(REGIONS)))
+    p.add_argument("--bbox", help="w,s,e,n; overrides --region")
+    p.add_argument("--budget", type=int, help="cells you can hold. Default is "
+                   "EXACT: cols x rows x 2, the pixel count of the frame -- "
+                   "every cell past it averages into a bin that already has one")
+    p.add_argument("--layer", default="elevation_surface")
+    p.add_argument("--width", type=int, help="columns; default is your terminal")
+    p.add_argument("--height", type=int, help="character rows; default is your terminal")
+    p.add_argument("--ascii", action="store_true")
+    p.add_argument("--globe", action="store_true",
+                   help="orthographic ball earth; g toggles it live")
+    p.set_defaults(fn=cmd_bench)
+
+    p = sub.add_parser("ticket", help="one fetch ticket, in full")
+    p.add_argument("ticket")
+    p.set_defaults(fn=cmd_ticket)
+
+    # the service verbs -- see the header; these are what init.claude runs
+    for verb, help_ in (("status", "one line per workload: pods, ready, commit, health"),
+                        ("health", "the raw /health of all five"),
+                        ("start", "scale the five deployments to one"),
+                        ("stop", "scale the five deployments to zero"),
+                        ("restart", "rollout restart, same image (new code is bin/roll.sh)")):
+        p = sub.add_parser(verb, help=help_)
+        p.set_defaults(fn=cmd_service, verb=verb)
+    p = sub.add_parser("logs", help="follow one deployment's log")
+    p.add_argument("name", nargs="?", default="kingfisher")
+    p.set_defaults(fn=cmd_service, verb="logs")
+
+    args = ap.parse_args()
+    sys.exit(args.fn(args))
+
+
+if __name__ == "__main__":
+    main()

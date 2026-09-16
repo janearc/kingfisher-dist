@@ -1,0 +1,38 @@
+# game: this repository
+#
+# name is the project: it is the block in the builder's own config that
+# says where this tree's two remotes are. nothing here holds a remote,
+# and a builder who has no block for it builds locally.
+name kingfisher-dist
+
+# the contact the imagery and weather providers ask every client to
+# declare. it is the operator's name and address, so it is set in their
+# own config and never written here.
+needs KINGFISHER_CONTACT a name and address the data providers can reach
+
+# the lint kingfisher holds. a repository that describes any lint describes
+# all of it, so this list is the whole of it, and the card is not on it:
+# kingfisher is the largest thing here, its readme is a manpage rather than
+# a screen, and its reference pages are long because the surface is.
+lint width 80
+lint comments
+lint exclaim
+lint shout
+lint paragraph 4
+lint words hyperscaler enterprise-grade blazing-fast load-bearing
+
+# the two reference pages are let off two rules. a page of conditions and
+# a page of instructions run to more than four lines at a time, and both
+# name headers, environment variables and verbs in capitals because that
+# is what those things are called. every other page here is held to both.
+lint allow USING.md paragraph shout
+lint allow OPERATION.md paragraph shout
+
+# the readme is a manpage rather than a screen: fifty-nine lines, a third
+# of them bird. in a stack the strictest rule wins, so the card is waived
+# for this one page by name rather than by the dotfile's absence.
+lint allow README.md rows
+
+# the suite, as a target, so a stack build runs it the way a person does:
+# uv brings pytest, the repository brings the rest.
+target test . :: uv run --with pytest python -m pytest -q --no-header -p no:cacheprovider tests

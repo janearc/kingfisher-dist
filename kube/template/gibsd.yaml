@@ -1,0 +1,94 @@
+# kingfisher-gibsd -- live GOES-West clouds via NASA GIBS. Same shape as
+# weatherd's file; see openskyd's comment for the "why its own pod"
+# argument. the daemon clones weatherd's pattern exactly.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kingfisher-gibsd
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: kingfisher-gibsd
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kingfisher-gibsd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kingfisher-gibsd
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15025"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: gibsd
+          image: kingfisher:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/app/gibsd.py"]
+          ports:
+            - name: http
+              containerPort: 15025
+          env:
+            - name: KINGFISHER_SERVICE_NAME
+              value: kingfisher-gibsd
+            - name: GIBSD_OUT
+              value: /maps/clouds
+            - name: KINGFISHER_FLIPR_URL
+              value: "http://flipr.flipr"
+            - name: KINGFISHER_KAFKA_BOOTSTRAP
+              value: "kafka.${NAMESPACE}:9092"
+            - name: KINGFISHER_SCHEMA_REGISTRY
+              value: "http://schema-registry.${NAMESPACE}:8081"
+          volumeMounts:
+            # the ONE writer under maps/: gibsd owns clouds/, the serving
+            # pod reads it read-only -- same split as flights/ and weather/
+            - name: maps-clouds
+              mountPath: /maps/clouds
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+      volumes:
+        - name: maps-clouds
+          hostPath:
+            path: ${DATA_ROOT}/maps/clouds
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kingfisher-gibsd
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: kingfisher-gibsd
+spec:
+  selector:
+    app.kubernetes.io/name: kingfisher-gibsd
+  ports:
+    - name: http
+      port: 15025
+      targetPort: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: kingfisher-gibsd
+  namespace: ${NAMESPACE}
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`gibsd.test`) || Host(`kingfisher-gibsd.test`)
+      kind: Rule
+      services:
+        - name: kingfisher-gibsd
+          port: 15025

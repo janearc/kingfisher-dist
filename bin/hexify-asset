@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# hexify-asset -- turn a shelved raster into a shelved cell dataset.
+#
+# WHY THIS EXISTS. ingestd's ASSET pipeline is place-and-manifest: a GIBS
+# snapshot arrives as a JPEG and is served as a JPEG, which is right for a
+# viewer that draws images and useless to anything that draws CELLS. So the
+# five imagery layers on the shelf -- Blue Marble, Black Marble, the night
+# lights -- were invisible to every consumer kingfisher has grown since:
+# the priced door, the text renderer, anything asking for a window.
+#
+# This is the missing conversion, and it is deliberately a TOOL rather than an
+# ingestd pipeline for now. Dispatch there is one dict keyed on LAYER_KIND, a
+# raster-to-cells pipeline wants a kind of its own, and a kind is a change to
+# the contract -- which is not a thing to do in passing while somebody is
+# waiting to look at a map. The library half (hexify.hexify_equirect) is
+# where the work actually lives and is tested; when the enum lands this file
+# becomes four lines inside PIPELINES.
+#
+# RESOLUTION IS THE WHOLE DECISION. A world at res 4 is 288k cells and about
+# 9MB of JSON; res 5 is seven times that, and kingfisher reads a dataset whole
+# when it folds, inside a 256Mi limit. So global layers go in coarse and a
+# REGION goes in fine as its own dataset -- which is what the shelf is for,
+# and what the priced door already knows how to pick between.
+#
+#   bin/hexify-asset gibs-VIIRS_Black_Marble --res 4
+#   bin/hexify-asset gibs-VIIRS_Black_Marble --res 6 --region us --suffix us
+
+import argparse
+import io
+import json
+import os
+import sys
+import time
+import urllib.request
+
+# named windows, matching the ones bin/kingfisher already uses
+REGIONS = {
+    "sfbay":      (-123.10, 36.90, -121.20, 38.50),
+    "california": (-124.48, 32.53, -114.13, 42.01),
+    "cascadia":   (-124.80, 41.99, -116.90, 49.00),
+    "us":         (-125.00, 24.40,  -66.90, 49.40),
+    "world":      (-180.00, -85.00, 180.00,  85.00),
+}
+
+
+def die(msg):
+    print(f"hexify-asset: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def note(msg):
+    print(msg, file=sys.stderr)
+
+
+def bbox_from(manifest):
+    """The image's own extent, taken from the URL that fetched it.
+
+    THE PROVENANCE IS THE ONLY RECORD OF WHERE THE PIXELS ARE. ingest_asset
+    stores the request URL and nothing else geographic, so the BBOX parameter
+    in it decides the result -- and it is written s,w,n,e by the GIBS snapshot
+    API, which is not the order anything else here uses. Getting that wrong
+    puts the map on the wrong part of the planet while looking entirely fine.
+    """
+    prov = manifest.get("provenance", "")
+    if "BBOX=" not in prov:
+        return None
+    try:
+        s, w, n, e = (float(x) for x in prov.split("BBOX=")[1].split("&")[0].split(","))
+    except ValueError:
+        return None
+    return [w, s, e, n]
+
+
+def clip(a, b):
+    """The overlap of two [w,s,e,n] boxes, or None."""
+    out = [max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])]
+    return out if out[0] < out[2] and out[1] < out[3] else None
+
+
+def load_image(root, dataset, manifest, base_url):
+    """The payload, from disk if it is here and over HTTP if it is not."""
+    from PIL import Image
+    content = manifest.get("content") or "content.jpg"
+    local = os.path.join(root, dataset, content)
+    if os.path.isfile(local):
+        return Image.open(local).convert("RGB")
+    url = f"{base_url}/ingested/{dataset}/{content}"
+    note(f"reading {url}")
+    with urllib.request.urlopen(url, timeout=120) as r:
+        return Image.open(io.BytesIO(r.read())).convert("RGB")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="hexify-asset")
+    ap.add_argument("dataset", help="a shelved asset id, e.g. gibs-VIIRS_Black_Marble")
+    ap.add_argument("--res", type=int, default=4, help="H3 resolution (default 4)")
+    ap.add_argument("--region", help="clip to a named window: " + ", ".join(sorted(REGIONS)))
+    ap.add_argument("--bbox", help="clip to w,s,e,n; overrides --region")
+    ap.add_argument("--suffix", help="dataset id suffix (default the resolution)")
+    ap.add_argument("--out", default=os.environ.get(
+        "INGESTD_OUT", "/srv/kingfisher/maps/ingested"))
+    ap.add_argument("--url", default=os.environ.get("KINGFISHER_URL", "http://kingfisher.test"))
+    args = ap.parse_args()
+
+    import h3
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from hexify import bounds_of, hexify_equirect
+
+    root = args.out.rstrip("/")
+    mpath = os.path.join(root, args.dataset, "manifest.json")
+    if not os.path.isfile(mpath):
+        die(f"no manifest at {mpath}")
+    manifest = json.load(open(mpath))
+
+    image_box = bbox_from(manifest)
+    if not image_box:
+        die("the manifest's provenance carries no BBOX; cannot place these pixels")
+
+    window = image_box
+    if args.bbox:
+        try:
+            want = [float(x) for x in args.bbox.split(",")]
+            if len(want) != 4:
+                raise ValueError
+        except ValueError:
+            die("--bbox wants four numbers: w,s,e,n")
+        window = clip(image_box, want)
+    elif args.region:
+        if args.region not in REGIONS:
+            die(f"unknown region {args.region!r}")
+        window = clip(image_box, list(REGIONS[args.region]))
+    if not window:
+        die("that window does not overlap the image")
+
+    img = load_image(root, args.dataset, manifest, args.url.rstrip("/"))
+    note(f"image {img.size[0]}x{img.size[1]}  image bbox {image_box}")
+    note(f"sampling {window} at res {args.res} ...")
+
+    t0 = time.time()
+    cells = hexify_equirect(img.load(), img.size, image_box, args.res, h3,
+                            mode="luminance")
+    # clip AFTER sampling: cells_in walks the image's own box, and restricting
+    # it to the window here keeps one code path for both cases
+    if window != image_box:
+        cells = {c: v for c, v in cells.items()
+                 if window[0] <= h3.cell_to_latlng(c)[1] <= window[2]
+                 and window[1] <= h3.cell_to_latlng(c)[0] <= window[3]}
+    if not cells:
+        die("no cells sampled; check the window")
+    elapsed = round(time.time() - t0, 1)
+
+    suffix = args.suffix or f"r{args.res}"
+    out_id = f"{args.dataset}-{suffix}"
+    dest = os.path.join(root, out_id)
+    if os.path.exists(dest):
+        die(f"{dest} exists; re-hexing is a deliberate deletion first")
+
+    lo = min(cells.values())
+    hi = max(cells.values())
+    out = {
+        "id": out_id,
+        "title": manifest.get("title", args.dataset) + f" (H3 res {args.res})",
+        "description": (
+            f"{len(cells):,} H3 cells at resolution {args.res}, sampled from the "
+            f"{img.size[0]}x{img.size[1]} snapshot. brightness is Rec.709 luminance "
+            f"of the image, 0..255 -- a MEASUREMENT OF THE PICTURE, not of the "
+            f"ground: it inherits whatever the layer encodes, and for the night "
+            f"lights that is city glow with no-data rendered white."),
+        "content": "cells.json",
+        "content_type": "application/json",
+        "kind": "LAYER_KIND_INTENSIVE",
+        "layers": {"brightness": {"kind": "LAYER_KIND_INTENSIVE", "unit": "luminance"}},
+        "vintage_id": manifest.get("vintage_id", ""),
+        "source_id": manifest.get("source_id", ""),
+        "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "provenance": manifest.get("provenance", ""),
+        "pipeline": {
+            "res": args.res,
+            "cells": len(cells),
+            "bbox": bounds_of(cells, h3),
+            "points_used": len(cells),
+            "source_dataset": args.dataset,
+            "source_image": list(img.size),
+            "image_bbox": image_box,
+            "window": window,
+            "mode": "luminance",
+            "value_range": [round(lo, 2), round(hi, 2)],
+            "elapsed_s": elapsed,
+        },
+    }
+
+    # ATOMIC, tmp then rename, exactly as ingestd does -- a half-written
+    # dataset that looks whole is the thing the shelf must never contain.
+    tmp = dest + ".tmp"
+    os.makedirs(tmp, exist_ok=True)
+    with open(os.path.join(tmp, "cells.json"), "w") as f:
+        json.dump({"res": args.res, "cells": {c: {"brightness": v}
+                                              for c, v in cells.items()}}, f)
+    with open(os.path.join(tmp, "manifest.json"), "w") as f:
+        json.dump(out, f, indent=1)
+    os.rename(tmp, dest)
+
+    note(f"-- {len(cells):,} cells, brightness {lo:.1f}..{hi:.1f}, {elapsed}s")
+    print(out_id)
+
+
+if __name__ == "__main__":
+    main()
